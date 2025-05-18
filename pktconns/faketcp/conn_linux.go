@@ -19,7 +19,6 @@ import (
 	"github.com/coreos/go-iptables/iptables"
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
-	// "github.com/sagernet/sing-quic/pktconns" // Explicitly ensure this line and the one below are removed or fully commented
 )
 
 var (

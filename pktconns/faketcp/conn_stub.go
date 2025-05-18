@@ -6,7 +6,6 @@ package faketcp
 import (
 	"errors"
 	// "net" // Not strictly needed for the stub implementations if not returning a concrete type
-	// No longer import "github.com/sagernet/sing-quic/pktconns"
 )
 
 func init() {

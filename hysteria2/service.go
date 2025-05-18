@@ -11,15 +11,16 @@ import (
 	"sync"
 	"time"
 
+	qtls "github.com/ericcug/sing-quic"
+	congestion_meta1 "github.com/ericcug/sing-quic/congestion_meta1"
+	congestion_meta2 "github.com/ericcug/sing-quic/congestion_meta2"
+	"github.com/ericcug/sing-quic/hysteria"
+	hyCC "github.com/ericcug/sing-quic/hysteria/congestion"
+	"github.com/ericcug/sing-quic/hysteria2/internal/protocol"
+	"github.com/ericcug/sing-quic/pktconns/faketcp" // Added for faketcp
 	"github.com/sagernet/quic-go"
 	"github.com/sagernet/quic-go/congestion"
 	"github.com/sagernet/quic-go/http3"
-	"github.com/sagernet/sing-quic"
-	congestion_meta1 "github.com/sagernet/sing-quic/congestion_meta1"
-	congestion_meta2 "github.com/sagernet/sing-quic/congestion_meta2"
-	"github.com/sagernet/sing-quic/hysteria"
-	hyCC "github.com/sagernet/sing-quic/hysteria/congestion"
-	"github.com/sagernet/sing-quic/hysteria2/internal/protocol"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/auth"
 	"github.com/sagernet/sing/common/baderror"
@@ -44,6 +45,8 @@ type ServiceOptions struct {
 	UDPTimeout            time.Duration
 	Handler               ServerHandler
 	MasqueradeHandler     http.Handler
+	Transport             string // "udp" (default) or "faketcp"
+	ListenAddress         string // e.g., ":443" or "0.0.0.0:443"
 }
 
 type ServerHandler interface {
@@ -66,6 +69,9 @@ type Service[U comparable] struct {
 	udpTimeout            time.Duration
 	handler               ServerHandler
 	masqueradeHandler     http.Handler
+	transport             string
+	listenAddress         string
+	packetListener        net.PacketConn // Store the underlying packet conn for closing
 	quicListener          io.Closer
 }
 
@@ -102,6 +108,8 @@ func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
 		udpTimeout:            options.UDPTimeout,
 		handler:               options.Handler,
 		masqueradeHandler:     options.MasqueradeHandler,
+		transport:             options.Transport,
+		listenAddress:         options.ListenAddress,
 	}, nil
 }
 
@@ -113,16 +121,48 @@ func (s *Service[U]) UpdateUsers(userList []U, passwordList []string) {
 	s.userMap = userMap
 }
 
-func (s *Service[U]) Start(conn net.PacketConn) error {
-	if s.salamanderPassword != "" {
-		conn = NewSalamanderConn(conn, []byte(s.salamanderPassword))
+func (s *Service[U]) Start() error {
+	var pConn net.PacketConn
+	var err error
+
+	if s.listenAddress == "" {
+		return E.New("ListenAddress is required in ServiceOptions")
 	}
-	err := qtls.ConfigureHTTP3(s.tlsConfig)
+
+	if s.transport == "faketcp" {
+		// fakeTCPLoggerAdapter is defined in client.go in the same package
+		ftLogger := &fakeTCPLoggerAdapter{Logger: s.logger}
+		pConn, err = faketcp.Listen("tcp", s.listenAddress, ftLogger)
+		if err != nil {
+			return E.Cause(err, "faketcp listen failed")
+		}
+	} else {
+		// Default to UDP
+		udpAddr, resolveErr := net.ResolveUDPAddr("udp", s.listenAddress)
+		if resolveErr != nil {
+			return E.Cause(resolveErr, "resolve udp address failed")
+		}
+		pConn, err = net.ListenUDP("udp", udpAddr)
+		if err != nil {
+			return E.Cause(err, "udp listen failed")
+		}
+	}
+	s.packetListener = pConn // Store for closing
+
+	finalPConn := pConn
+	if s.salamanderPassword != "" {
+		finalPConn = NewSalamanderConn(finalPConn, []byte(s.salamanderPassword))
+	}
+
+	err = qtls.ConfigureHTTP3(s.tlsConfig)
 	if err != nil {
+		pConn.Close()
 		return err
 	}
-	listener, err := qtls.Listen(conn, s.tlsConfig, s.quicConfig)
+
+	listener, err := qtls.Listen(finalPConn, s.tlsConfig, s.quicConfig)
 	if err != nil {
+		pConn.Close() // Close the underlying packet conn if qtls.Listen fails
 		return err
 	}
 	s.quicListener = listener
@@ -133,6 +173,7 @@ func (s *Service[U]) Start(conn net.PacketConn) error {
 func (s *Service[U]) Close() error {
 	return common.Close(
 		s.quicListener,
+		s.packetListener, // Also close the underlying packet listener
 	)
 }
 

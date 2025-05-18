@@ -4,7 +4,6 @@ import (
 	"net"
 	"syscall" // Added for syscall.RawConn
 	"time"
-	// No longer import "github.com/sagernet/sing-quic/pktconns" here
 )
 
 // logger is an internal interface for logging within the faketcp package.

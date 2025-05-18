@@ -11,15 +11,18 @@ import (
 	"sync"
 	"time"
 
+	"fmt" // Added for logger adapter
+
+	qtls "github.com/ericcug/sing-quic"
+	congestion_meta1 "github.com/ericcug/sing-quic/congestion_meta1"
+	congestion_meta2 "github.com/ericcug/sing-quic/congestion_meta2"
+	"github.com/ericcug/sing-quic/hysteria"
+	hyCC "github.com/ericcug/sing-quic/hysteria/congestion"
+	"github.com/ericcug/sing-quic/hysteria2/internal/protocol"
+	"github.com/ericcug/sing-quic/pktconns/faketcp" // Added for faketcp
 	"github.com/sagernet/quic-go"
 	"github.com/sagernet/quic-go/congestion"
 	"github.com/sagernet/quic-go/http3"
-	"github.com/sagernet/sing-quic"
-	congestion_meta1 "github.com/sagernet/sing-quic/congestion_meta1"
-	congestion_meta2 "github.com/sagernet/sing-quic/congestion_meta2"
-	"github.com/sagernet/sing-quic/hysteria"
-	hyCC "github.com/sagernet/sing-quic/hysteria/congestion"
-	"github.com/sagernet/sing-quic/hysteria2/internal/protocol"
 	"github.com/sagernet/sing/common/baderror"
 	"github.com/sagernet/sing/common/bufio"
 	E "github.com/sagernet/sing/common/exceptions"
@@ -29,6 +32,27 @@ import (
 	"github.com/sagernet/sing/common/ntp"
 	aTLS "github.com/sagernet/sing/common/tls"
 )
+
+// fakeTCPLoggerAdapter adapts sing/common/logger.Logger to faketcp.logger
+type fakeTCPLoggerAdapter struct {
+	logger.Logger
+}
+
+func (a *fakeTCPLoggerAdapter) Debugf(format string, args ...interface{}) {
+	a.Logger.Debug(fmt.Sprintf(format, args...))
+}
+
+func (a *fakeTCPLoggerAdapter) Infof(format string, args ...interface{}) {
+	a.Logger.Info(fmt.Sprintf(format, args...))
+}
+
+func (a *fakeTCPLoggerAdapter) Warnf(format string, args ...interface{}) {
+	a.Logger.Warn(fmt.Sprintf(format, args...))
+}
+
+func (a *fakeTCPLoggerAdapter) Errorf(format string, args ...interface{}) {
+	a.Logger.Error(fmt.Sprintf(format, args...))
+}
 
 type ClientOptions struct {
 	Context            context.Context
@@ -44,6 +68,7 @@ type ClientOptions struct {
 	Password           string
 	TLSConfig          aTLS.Config
 	UDPDisabled        bool
+	Transport          string // "udp" (default) or "faketcp"
 }
 
 type Client struct {
@@ -61,6 +86,7 @@ type Client struct {
 	tlsConfig          aTLS.Config
 	quicConfig         *quic.Config
 	udpDisabled        bool
+	transport          string // Added transport
 
 	connAccess sync.RWMutex
 	conn       *clientQUICConnection
@@ -103,6 +129,7 @@ func NewClient(options ClientOptions) (*Client, error) {
 		tlsConfig:          options.TLSConfig,
 		quicConfig:         quicConfig,
 		udpDisabled:        options.UDPDisabled,
+		transport:          options.Transport, // Added transport
 	}, nil
 }
 
@@ -125,34 +152,51 @@ func (c *Client) offer(ctx context.Context) (*clientQUICConnection, error) {
 }
 
 func (c *Client) offerNew(ctx context.Context) (*clientQUICConnection, error) {
-	dialFunc := func(serverAddr M.Socksaddr) (net.PacketConn, error) {
-		udpConn, err := c.dialer.DialContext(c.ctx, "udp", serverAddr)
-		if err != nil {
-			return nil, err
+	dialLogic := func(targetAddr M.Socksaddr) (net.PacketConn, error) {
+		var rawConn net.PacketConn
+		var err error
+		if c.transport == "faketcp" {
+			ftLogger := &fakeTCPLoggerAdapter{Logger: c.logger}
+			rawConn, err = faketcp.Dial("tcp", targetAddr.String(), ftLogger)
+			if err != nil {
+				return nil, E.Cause(err, "faketcp dial failed")
+			}
+		} else {
+			// Default to UDP
+			udpUnderlyingConn, dialErr := c.dialer.DialContext(c.ctx, "udp", targetAddr)
+			if dialErr != nil {
+				return nil, dialErr
+			}
+			rawConn = bufio.NewUnbindPacketConn(udpUnderlyingConn)
 		}
-		var packetConn net.PacketConn
-		packetConn = bufio.NewUnbindPacketConn(udpConn)
+
 		if c.salamanderPassword != "" {
-			packetConn = NewSalamanderConn(packetConn, []byte(c.salamanderPassword))
+			rawConn = NewSalamanderConn(rawConn, []byte(c.salamanderPassword))
 		}
-		return packetConn, nil
+		return rawConn, nil
 	}
+
 	var (
-		packetConn net.PacketConn
-		err        error
+		finalPacketConn net.PacketConn
+		err             error
 	)
 	if len(c.serverPorts) == 0 {
-		packetConn, err = dialFunc(c.serverAddr)
+		finalPacketConn, err = dialLogic(c.serverAddr)
 	} else {
-		packetConn, err = hysteria.NewHopPacketConn(dialFunc, c.serverAddr, c.serverPorts, c.hopInterval)
+		hopDialFunc := func(hopTargetAddr M.Socksaddr) (net.PacketConn, error) {
+			return dialLogic(hopTargetAddr)
+		}
+		finalPacketConn, err = hysteria.NewHopPacketConn(hopDialFunc, c.serverAddr, c.serverPorts, c.hopInterval)
 	}
 	if err != nil {
 		return nil, err
 	}
+
 	var quicConn quic.EarlyConnection
-	http3Transport, err := qtls.CreateTransport(packetConn, &quicConn, c.serverAddr, c.tlsConfig, c.quicConfig)
+	// Use finalPacketConn here
+	http3Transport, err := qtls.CreateTransport(finalPacketConn, &quicConn, c.serverAddr, c.tlsConfig, c.quicConfig)
 	if err != nil {
-		packetConn.Close()
+		finalPacketConn.Close() // Close the packetConn if transport creation fails
 		return nil, err
 	}
 	request := &http.Request{
@@ -170,7 +214,7 @@ func (c *Client) offerNew(ctx context.Context) (*clientQUICConnection, error) {
 		if quicConn != nil {
 			quicConn.CloseWithError(0, "")
 		}
-		packetConn.Close()
+		finalPacketConn.Close() // Close the packetConn
 		return nil, err
 	}
 	response.Body.Close()
@@ -178,7 +222,7 @@ func (c *Client) offerNew(ctx context.Context) (*clientQUICConnection, error) {
 		if quicConn != nil {
 			quicConn.CloseWithError(0, "")
 		}
-		packetConn.Close()
+		finalPacketConn.Close() // Close the packetConn
 		return nil, E.New("authentication failed, status code: ", response.StatusCode)
 	}
 	authResponse := protocol.AuthResponseFromHeader(response.Header)
@@ -201,7 +245,7 @@ func (c *Client) offerNew(ctx context.Context) (*clientQUICConnection, error) {
 	}
 	conn := &clientQUICConnection{
 		quicConn:    quicConn,
-		rawConn:     packetConn,
+		rawConn:     finalPacketConn, // Use finalPacketConn
 		connDone:    make(chan struct{}),
 		udpDisabled: !authResponse.UDPEnabled,
 		udpConnMap:  make(map[uint32]*udpPacketConn),

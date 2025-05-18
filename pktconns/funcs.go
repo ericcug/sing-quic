@@ -4,7 +4,7 @@ import (
 	"net"
 	// "time" // hopInterval is not used for faketcp, so time might not be needed directly here
 
-	"github.com/sagernet/sing-quic/pktconns/faketcp" // Adjusted import path
+	"github.com/ericcug/sing-quic/pktconns/faketcp" // Adjusted import path
 )
 
 // UDPProviderMaxDatagramSize is the default max datagram size for UDP.

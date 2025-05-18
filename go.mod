@@ -3,7 +3,9 @@ module github.com/sagernet/sing-quic
 go 1.20
 
 require (
+	github.com/coreos/go-iptables v0.6.0
 	github.com/gofrs/uuid/v5 v5.3.2
+	github.com/google/gopacket v1.1.19
 	github.com/sagernet/quic-go v0.49.0-beta.1
 	github.com/sagernet/sing v0.6.5
 	golang.org/x/crypto v0.32.0

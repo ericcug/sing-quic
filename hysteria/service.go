@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"github.com/sagernet/quic-go"
-	"github.com/sagernet/sing-quic"
+	qtls "github.com/sagernet/sing-quic"
 	hyCC "github.com/sagernet/sing-quic/hysteria/congestion"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/auth"
@@ -42,7 +42,12 @@ type ServiceOptions struct {
 	ConnReceiveWindow   uint64
 	StreamReceiveWindow uint64
 	MaxIncomingStreams  int64
-	DisableMTUDiscovery bool
+	DisableMTUDiscovery bool // Already exists
+
+	// New fields for FakeTCP and Adaptive Congestion Control
+	FakeTCP               bool   // Not directly used by this lib, but passed by sing-box for its logic
+	CongestionControl     string // "brutal" or "stable"
+	QuicInitialPacketSize uint16 // To set quic.Config.InitialPacketSize when FakeTCP is true
 }
 
 type ServerHandler interface {
@@ -64,6 +69,8 @@ type Service[U comparable] struct {
 	udpTimeout    time.Duration
 	handler       ServerHandler
 	quicListener  io.Closer
+	// Store new options
+	congestionControl string
 }
 
 func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
@@ -89,9 +96,17 @@ func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
 	if options.MaxIncomingStreams > 0 {
 		quicConfig.MaxIncomingStreams = int64(options.MaxIncomingStreams)
 	}
-	if options.DisableMTUDiscovery {
+	if options.DisableMTUDiscovery { // This is the original DisableMTUDiscovery from HysteriaInboundOptions
 		quicConfig.DisablePathMTUDiscovery = true
 	}
+	// If FakeTCP is intended (handled by sing-box by passing FakeTCP=true and appropriate listener),
+	// then DisableMTUDiscovery should also be true.
+	// And QuicInitialPacketSize might be set.
+	if options.QuicInitialPacketSize > 0 { // This implies FakeTCP is active and a specific size is requested
+		quicConfig.InitialPacketSize = options.QuicInitialPacketSize
+		quicConfig.DisablePathMTUDiscovery = true // Ensure PMTUD is off if we're setting initial packet size for FakeTCP
+	}
+
 	if len(options.TLSConfig.NextProtos()) == 0 {
 		options.TLSConfig.SetNextProtos([]string{DefaultALPN})
 	}
@@ -114,6 +129,8 @@ func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
 		handler:       options.Handler,
 		udpDisabled:   options.UDPDisabled,
 		udpTimeout:    options.UDPTimeout,
+		// Store new options
+		congestionControl: options.CongestionControl,
 	}, nil
 }
 
@@ -213,7 +230,13 @@ func (s *serverSession[U]) handleConnection() {
 		return
 	}
 	s.authUser = user
-	s.quicConn.SetCongestionControl(hyCC.NewBrutalSender(uint64(math.Min(float64(s.sendBPS), float64(clientHello.RecvBPS))), s.brutalDebug, s.logger))
+
+	congestionControlMode := s.Service.congestionControl // Use stored congestionControl option from Service
+	if congestionControlMode == "" {
+		congestionControlMode = "brutal" // Default if not specified
+	}
+	s.quicConn.SetCongestionControl(hyCC.NewBrutalSenderWithMode(uint64(math.Min(float64(s.sendBPS), float64(clientHello.RecvBPS))), congestionControlMode, s.brutalDebug, s.logger))
+
 	if !s.udpDisabled {
 		go s.loopMessages()
 	}

@@ -23,7 +23,7 @@ var _ congestion.CongestionControlEx = &BrutalSender{}
 type BrutalSender struct {
 	rttStats        congestion.RTTStatsProvider
 	bps             congestion.ByteCount
-	maxDatagramSize congestion.ByteCount
+	maxDatagramSize congestion.ByteCount // This will be set by NewBrutalSender via NewAckHandler from quic.Config.InitialPacketSize
 	pacer           *pacer
 
 	pktInfoSlots          [pktInfoSlotCount]pktInfo
@@ -31,6 +31,9 @@ type BrutalSender struct {
 	debug                 bool
 	logger                logger.Logger
 	lastAckPrintTimestamp int64
+
+	// New field
+	pacingGain float64 // e.g., 1.5 for stable, 2.0 for brutal
 }
 
 type pktInfo struct {
@@ -46,6 +49,27 @@ func NewBrutalSender(bps uint64, debug bool, logger logger.Logger) *BrutalSender
 		ackRate:         1,
 		debug:           debug,
 		logger:          logger,
+	}
+	bs.pacer = newPacer(func() congestion.ByteCount {
+		return congestion.ByteCount(float64(bs.bps) / bs.ackRate)
+	})
+	return bs
+}
+
+// NewBrutalSenderWithMode creates a BrutalSender with a specific congestion control mode.
+func NewBrutalSenderWithMode(bps uint64, mode string, debug bool, logger logger.Logger) *BrutalSender {
+	bs := &BrutalSender{
+		bps:             congestion.ByteCount(bps),
+		maxDatagramSize: initMaxDatagramSize, // This is an initial value, actual one comes from AckHandler via quic.Config
+		ackRate:         1,
+		debug:           debug,
+		logger:          logger,
+	}
+	// Set pacing gain based on mode
+	if mode == "stable" {
+		bs.pacingGain = 1.5
+	} else { // Default to "brutal" behavior
+		bs.pacingGain = 2.0 // Corresponds to original congestionWindowMultiplier = 2
 	}
 	bs.pacer = newPacer(func() congestion.ByteCount {
 		return congestion.ByteCount(float64(bs.bps) / bs.ackRate)
@@ -74,7 +98,8 @@ func (b *BrutalSender) GetCongestionWindow() congestion.ByteCount {
 	if rtt <= 0 {
 		return 10240
 	}
-	return congestion.ByteCount(float64(b.bps) * rtt.Seconds() * congestionWindowMultiplier / b.ackRate)
+	// Use pacingGain here instead of the constant congestionWindowMultiplier
+	return congestion.ByteCount(float64(b.bps) * rtt.Seconds() * b.pacingGain / b.ackRate)
 }
 
 func (b *BrutalSender) OnPacketSent(sentTime time.Time, bytesInFlight congestion.ByteCount,

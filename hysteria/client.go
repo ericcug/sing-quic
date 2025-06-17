@@ -13,7 +13,7 @@ import (
 	"time"
 
 	"github.com/sagernet/quic-go"
-	"github.com/sagernet/sing-quic"
+	qtls "github.com/sagernet/sing-quic"
 	hyCC "github.com/sagernet/sing-quic/hysteria/congestion"
 	"github.com/sagernet/sing/common/baderror"
 	"github.com/sagernet/sing/common/bufio"
@@ -44,7 +44,12 @@ type ClientOptions struct {
 
 	ConnReceiveWindow   uint64
 	StreamReceiveWindow uint64
-	DisableMTUDiscovery bool
+	DisableMTUDiscovery bool // Already exists
+
+	// New fields for FakeTCP and Adaptive Congestion Control
+	FakeTCP               bool   // Not directly used by this lib, but passed by sing-box for its logic
+	CongestionControl     string // "brutal" or "stable"
+	QuicInitialPacketSize uint16 // To set quic.Config.InitialPacketSize when FakeTCP is true
 }
 
 type Client struct {
@@ -60,8 +65,10 @@ type Client struct {
 	xplusPassword string
 	password      string
 	tlsConfig     aTLS.Config
-	quicConfig    *quic.Config
+	quicConfig    *quic.Config // Will be configured with InitialPacketSize and DisablePMTUD based on options
 	udpDisabled   bool
+	// Store new options for later use if needed, e.g., passing to congestion controller
+	congestionControl string
 
 	connAccess sync.RWMutex
 	conn       *clientQUICConnection
@@ -86,9 +93,17 @@ func NewClient(options ClientOptions) (*Client, error) {
 		quicConfig.InitialConnectionReceiveWindow = options.ConnReceiveWindow
 		quicConfig.MaxConnectionReceiveWindow = options.ConnReceiveWindow
 	}
-	if options.DisableMTUDiscovery {
+	if options.DisableMTUDiscovery { // This is the original DisableMTUDiscovery from HysteriaOutboundOptions
 		quicConfig.DisablePathMTUDiscovery = true
 	}
+	// If FakeTCP is intended (handled by sing-box by passing FakeTCP=true and appropriate Dialer),
+	// then DisableMTUDiscovery should also be true.
+	// And QuicInitialPacketSize might be set.
+	if options.QuicInitialPacketSize > 0 { // This implies FakeTCP is active and a specific size is requested
+		quicConfig.InitialPacketSize = options.QuicInitialPacketSize
+		quicConfig.DisablePathMTUDiscovery = true // Ensure PMTUD is off if we're setting initial packet size for FakeTCP
+	}
+
 	if len(options.TLSConfig.NextProtos()) == 0 {
 		options.TLSConfig.SetNextProtos([]string{DefaultALPN})
 	}
@@ -125,6 +140,8 @@ func NewClient(options ClientOptions) (*Client, error) {
 		tlsConfig:     options.TLSConfig,
 		quicConfig:    quicConfig,
 		udpDisabled:   options.UDPDisabled,
+		// Store new options
+		congestionControl: options.CongestionControl,
 	}, nil
 }
 
@@ -231,7 +248,13 @@ func (c *Client) offerNew(ctx context.Context) (*clientQUICConnection, error) {
 		packetConn.Close()
 		return nil, E.New("remote error: ", serverHello.Message)
 	}
-	quicConn.SetCongestionControl(hyCC.NewBrutalSender(uint64(math.Min(float64(serverHello.RecvBPS), float64(c.sendBPS))), c.brutalDebug, c.logger))
+
+	congestionControlMode := c.congestionControl // Use stored congestionControl option
+	if congestionControlMode == "" {
+		congestionControlMode = "brutal" // Default if not specified
+	}
+	quicConn.SetCongestionControl(hyCC.NewBrutalSenderWithMode(uint64(math.Min(float64(serverHello.RecvBPS), float64(c.sendBPS))), congestionControlMode, c.brutalDebug, c.logger))
+
 	conn := &clientQUICConnection{
 		quicConn:    quicConn,
 		rawConn:     packetConn,

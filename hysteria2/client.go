@@ -14,7 +14,7 @@ import (
 	"github.com/sagernet/quic-go"
 	"github.com/sagernet/quic-go/congestion"
 	"github.com/sagernet/quic-go/http3"
-	"github.com/sagernet/sing-quic"
+	qtls "github.com/sagernet/sing-quic"
 	congestion_meta1 "github.com/sagernet/sing-quic/congestion_meta1"
 	congestion_meta2 "github.com/sagernet/sing-quic/congestion_meta2"
 	"github.com/sagernet/sing-quic/hysteria"
@@ -44,6 +44,7 @@ type ClientOptions struct {
 	Password           string
 	TLSConfig          aTLS.Config
 	UDPDisabled        bool
+	CongestionControl  string
 }
 
 type Client struct {
@@ -61,6 +62,7 @@ type Client struct {
 	tlsConfig          aTLS.Config
 	quicConfig         *quic.Config
 	udpDisabled        bool
+	congestionControl  string
 
 	connAccess sync.RWMutex
 	conn       *clientQUICConnection
@@ -103,6 +105,7 @@ func NewClient(options ClientOptions) (*Client, error) {
 		tlsConfig:          options.TLSConfig,
 		quicConfig:         quicConfig,
 		udpDisabled:        options.UDPDisabled,
+		congestionControl:  options.CongestionControl,
 	}, nil
 }
 
@@ -186,7 +189,9 @@ func (c *Client) offerNew(ctx context.Context) (*clientQUICConnection, error) {
 	if actualTx == 0 || actualTx > c.sendBPS {
 		actualTx = c.sendBPS
 	}
-	if !authResponse.RxAuto && actualTx > 0 {
+	if c.congestionControl != "" {
+		quicConn.SetCongestionControl(hyCC.NewBrutalSenderWithMode(actualTx, c.congestionControl, c.brutalDebug, c.logger))
+	} else if !authResponse.RxAuto && actualTx > 0 {
 		quicConn.SetCongestionControl(hyCC.NewBrutalSender(actualTx, c.brutalDebug, c.logger))
 	} else {
 		timeFunc := ntp.TimeFuncFromContext(c.ctx)

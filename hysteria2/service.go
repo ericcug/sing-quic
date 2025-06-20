@@ -14,7 +14,7 @@ import (
 	"github.com/sagernet/quic-go"
 	"github.com/sagernet/quic-go/congestion"
 	"github.com/sagernet/quic-go/http3"
-	"github.com/sagernet/sing-quic"
+	qtls "github.com/sagernet/sing-quic"
 	congestion_meta1 "github.com/sagernet/sing-quic/congestion_meta1"
 	congestion_meta2 "github.com/sagernet/sing-quic/congestion_meta2"
 	"github.com/sagernet/sing-quic/hysteria"
@@ -44,6 +44,7 @@ type ServiceOptions struct {
 	UDPTimeout            time.Duration
 	Handler               ServerHandler
 	MasqueradeHandler     http.Handler
+	CongestionControl     string
 }
 
 type ServerHandler interface {
@@ -66,6 +67,7 @@ type Service[U comparable] struct {
 	udpTimeout            time.Duration
 	handler               ServerHandler
 	masqueradeHandler     http.Handler
+	congestionControl     string
 	quicListener          io.Closer
 }
 
@@ -102,6 +104,7 @@ func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
 		udpTimeout:            options.UDPTimeout,
 		handler:               options.Handler,
 		masqueradeHandler:     options.MasqueradeHandler,
+		congestionControl:     options.CongestionControl,
 	}, nil
 }
 
@@ -202,7 +205,13 @@ func (s *serverSession[U]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.authUser = user
 		s.authenticated = true
 		var rxAuto bool
-		if s.receiveBPS > 0 && s.ignoreClientBandwidth && request.Rx == 0 {
+		if s.congestionControl != "" {
+			rx := request.Rx
+			if s.sendBPS > 0 && rx > s.sendBPS {
+				rx = s.sendBPS
+			}
+			s.quicConn.SetCongestionControl(hyCC.NewBrutalSenderWithMode(rx, s.congestionControl, s.brutalDebug, s.logger))
+		} else if s.receiveBPS > 0 && s.ignoreClientBandwidth && request.Rx == 0 {
 			s.logger.Debug("process connection from ", r.RemoteAddr, ": BBR disabled by server")
 			s.masqueradeHandler.ServeHTTP(w, r)
 			return

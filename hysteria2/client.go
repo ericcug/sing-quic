@@ -86,6 +86,7 @@ func NewClient(options ClientOptions) (*Client, error) {
 	}
 	if options.InitialPacketSize > 0 {
 		quicConfig.InitialPacketSize = options.InitialPacketSize
+		quicConfig.DisablePathMTUDiscovery = true
 	}
 	if len(options.TLSConfig.NextProtos()) == 0 {
 		options.TLSConfig.SetNextProtos([]string{http3.NextProtoH3})

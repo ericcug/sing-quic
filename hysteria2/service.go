@@ -45,6 +45,8 @@ type ServiceOptions struct {
 	Handler               ServerHandler
 	MasqueradeHandler     http.Handler
 	CongestionControl     string
+	DisableMTUDiscovery   bool
+	InitialPacketSize     uint16
 }
 
 type ServerHandler interface {
@@ -82,6 +84,12 @@ func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
 		MaxConnectionReceiveWindow:     hysteria.DefaultConnReceiveWindow,
 		MaxIdleTimeout:                 hysteria.DefaultMaxIdleTimeout,
 		KeepAlivePeriod:                hysteria.DefaultKeepAlivePeriod,
+	}
+	if options.DisableMTUDiscovery {
+		quicConfig.DisablePathMTUDiscovery = true
+	}
+	if options.InitialPacketSize > 0 {
+		quicConfig.InitialPacketSize = options.InitialPacketSize
 	}
 	if options.MasqueradeHandler == nil {
 		options.MasqueradeHandler = http.NotFoundHandler()

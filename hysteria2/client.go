@@ -31,20 +31,22 @@ import (
 )
 
 type ClientOptions struct {
-	Context            context.Context
-	Dialer             N.Dialer
-	Logger             logger.Logger
-	BrutalDebug        bool
-	ServerAddress      M.Socksaddr
-	ServerPorts        []string
-	HopInterval        time.Duration
-	SendBPS            uint64
-	ReceiveBPS         uint64
-	SalamanderPassword string
-	Password           string
-	TLSConfig          aTLS.Config
-	UDPDisabled        bool
-	CongestionControl  string
+	Context             context.Context
+	Dialer              N.Dialer
+	Logger              logger.Logger
+	BrutalDebug         bool
+	ServerAddress       M.Socksaddr
+	ServerPorts         []string
+	HopInterval         time.Duration
+	SendBPS             uint64
+	ReceiveBPS          uint64
+	SalamanderPassword  string
+	Password            string
+	TLSConfig           aTLS.Config
+	UDPDisabled         bool
+	CongestionControl   string
+	DisableMTUDiscovery bool
+	InitialPacketSize   uint16
 }
 
 type Client struct {
@@ -78,6 +80,12 @@ func NewClient(options ClientOptions) (*Client, error) {
 		MaxConnectionReceiveWindow:     hysteria.DefaultConnReceiveWindow,
 		MaxIdleTimeout:                 hysteria.DefaultMaxIdleTimeout,
 		KeepAlivePeriod:                hysteria.DefaultKeepAlivePeriod,
+	}
+	if options.DisableMTUDiscovery {
+		quicConfig.DisablePathMTUDiscovery = true
+	}
+	if options.InitialPacketSize > 0 {
+		quicConfig.InitialPacketSize = options.InitialPacketSize
 	}
 	if len(options.TLSConfig.NextProtos()) == 0 {
 		options.TLSConfig.SetNextProtos([]string{http3.NextProtoH3})

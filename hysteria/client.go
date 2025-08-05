@@ -12,9 +12,9 @@ import (
 	"sync"
 	"time"
 
+	qtls "github.com/ericcug/sing-quic"
+	hyCC "github.com/ericcug/sing-quic/hysteria/congestion"
 	"github.com/sagernet/quic-go"
-	qtls "github.com/sagernet/sing-quic"
-	hyCC "github.com/sagernet/sing-quic/hysteria/congestion"
 	"github.com/sagernet/sing/common/baderror"
 	"github.com/sagernet/sing/common/bufio"
 	"github.com/sagernet/sing/common/debug"

@@ -14,7 +14,6 @@ import (
 
 	"github.com/sagernet/quic-go"
 	"github.com/sagernet/quic-go/quicvarint"
-	"github.com/sagernet/sing-quic/hysteria2/internal/protocol"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/atomic"
 	"github.com/sagernet/sing/common/buf"
@@ -22,6 +21,8 @@ import (
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/common/pipe"
+
+	"github.com/ericcug/sing-quic/hysteria2/internal/protocol"
 )
 
 var udpMessagePool = sync.Pool{

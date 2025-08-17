@@ -2,7 +2,7 @@ module github.com/ericcug/sing-quic
 
 go 1.23.0
 
-toolchain go1.24.3
+go 1.23.0
 
 require (
 	github.com/gofrs/uuid/v5 v5.3.2

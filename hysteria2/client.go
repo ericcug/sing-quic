@@ -66,7 +66,7 @@ type Client struct {
 	udpDisabled        bool
 	congestionControl  string
 
-	connAccess sync.RWMutex
+	connAccess sync.Mutex
 	conn       *clientQUICConnection
 }
 
@@ -119,13 +119,9 @@ func NewClient(options ClientOptions) (*Client, error) {
 }
 
 func (c *Client) offer(ctx context.Context) (*clientQUICConnection, error) {
-	conn := c.conn
-	if conn != nil && conn.active() {
-		return conn, nil
-	}
 	c.connAccess.Lock()
 	defer c.connAccess.Unlock()
-	conn = c.conn
+	conn := c.conn
 	if conn != nil && conn.active() {
 		return conn, nil
 	}
@@ -269,6 +265,8 @@ func (c *Client) ListenPacket(ctx context.Context) (net.PacketConn, error) {
 }
 
 func (c *Client) CloseWithError(err error) error {
+	c.connAccess.Lock()
+	defer c.connAccess.Unlock()
 	conn := c.conn
 	if conn != nil {
 		conn.closeWithError(err)

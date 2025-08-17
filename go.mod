@@ -2,8 +2,6 @@ module github.com/ericcug/sing-quic
 
 go 1.23.0
 
-go 1.23.0
-
 require (
 	github.com/gofrs/uuid/v5 v5.3.2
 	github.com/sagernet/quic-go v0.52.0-beta.1

@@ -13,17 +13,18 @@ type mockRTTStats struct {
 	rtt time.Duration
 }
 
-func (m *mockRTTStats) MinRTT() time.Duration                      { return m.rtt }
-func (m *mockRTTStats) LatestRTT() time.Duration                   { return m.rtt }
-func (m *mockRTTStats) SmoothedRTT() time.Duration                 { return m.rtt }
-func (m *mockRTTStats) MeanDeviation() time.Duration               { return 0 }
-func (m *mockRTTStats) MaxAckDelay() time.Duration                 { return 0 }
-func (m *mockRTTStats) PTO(includeMaxAckDelay bool) time.Duration  { return 3 * m.rtt }
+func (m *mockRTTStats) MinRTT() time.Duration                       { return m.rtt }
+func (m *mockRTTStats) LatestRTT() time.Duration                    { return m.rtt }
+func (m *mockRTTStats) SmoothedRTT() time.Duration                  { return m.rtt }
+func (m *mockRTTStats) MeanDeviation() time.Duration                { return 0 }
+func (m *mockRTTStats) MaxAckDelay() time.Duration                  { return 0 }
+func (m *mockRTTStats) PTO(includeMaxAckDelay bool) time.Duration   { return 3 * m.rtt }
 func (m *mockRTTStats) UpdateRTT(sendDelta, ackDelay time.Duration) {}
-func (m *mockRTTStats) SetMaxAckDelay(mad time.Duration)           {}
-func (m *mockRTTStats) SetInitialRTT(t time.Duration)              {}
+func (m *mockRTTStats) SetMaxAckDelay(mad time.Duration)            {}
+func (m *mockRTTStats) SetInitialRTT(t time.Duration)               {}
 
 func TestBrutalSenderCongestionControlEx(t *testing.T) {
+	t.Parallel()
 	var cc any = NewBrutalSender(10*1024*1024, 1252, false, nil) // 10 MB/s
 
 	// 1. Verify that BrutalSender implements CongestionControlEx

@@ -1,0 +1,11 @@
+The rate-based QUIC controller code in this directory is original queqiao code.
+The pacing design and Brutal controller behavior are informed by the MIT-
+licensed Hysteria 2 project (https://github.com/apernet/hysteria), whose
+copyright notices are retained here for attribution. queqiao does not import
+Hysteria's internal packages.
+
+The optional TUIC-aligned BBR controller is an independent Go implementation
+of the public BBR model and the behavior documented by TUIC's
+quinn-congestions project (https://github.com/Tipuch/quinn-congestions). The
+reference implementation credits Google's BSD-licensed BBR design; queqiao
+does not copy Rust source or link to that crate.

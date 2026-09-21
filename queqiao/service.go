@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/sagernet/sing-quic/queqiao/internal/pep"
+	"github.com/sagernet/sing-quic/queqiao/internal/portmux"
 )
 
 type DestinationDialer = pep.DestinationDialer
@@ -29,8 +30,11 @@ type ServiceOptions struct {
 }
 
 type Service struct {
-	pepServer *pep.Server
-	cancel    context.CancelFunc
+	pepServer    *pep.Server
+	cancel       context.CancelFunc
+	hopPortCount int
+	providerID   string
+	logger       *slog.Logger
 }
 
 func NewService(opts ServiceOptions) (*Service, error) {
@@ -61,7 +65,11 @@ func NewService(opts ServiceOptions) (*Service, error) {
 		return nil, err
 	}
 
-	return &Service{pepServer: s}, nil
+	return &Service{
+		pepServer:    s,
+		hopPortCount: opts.HopPortCount,
+		logger:       opts.Logger,
+	}, nil
 }
 
 func (s *Service) Serve(ctx context.Context) error {
@@ -73,6 +81,37 @@ func (s *Service) Serve(ctx context.Context) error {
 func (s *Service) ServePacketConn(ctx context.Context, conn net.PacketConn) error {
 	serveCtx, cancel := context.WithCancel(ctx)
 	s.cancel = cancel
+
+	if s.hopPortCount > 1 {
+		if udpConn, ok := conn.(*net.UDPConn); ok {
+			primaryPort := udpConn.LocalAddr().(*net.UDPAddr).Port
+			providerID := s.providerID
+			if providerID == "" {
+				providerID = "queqiao"
+			}
+			ports := portmux.HopPorts(providerID, primaryPort, s.hopPortCount)
+			mux, err := portmux.NewServerPortMux(udpConn, ports)
+			if err == nil {
+				if s.logger != nil {
+					s.logger.Info("port hop listener ready",
+						"primary_addr", udpConn.LocalAddr(),
+						"hop_port_count", len(ports)-len(mux.SkippedPorts()),
+						"hop_ports_configured", len(ports),
+						"hop_ports_unavailable", mux.SkippedPorts())
+				}
+				conn = mux
+			} else {
+				if s.logger != nil {
+					s.logger.Error("failed to create port mux", "error", err.Error())
+				}
+			}
+		} else {
+			if s.logger != nil {
+				s.logger.Warn("cannot enable port hop: connection is not *net.UDPConn")
+			}
+		}
+	}
+
 	return s.pepServer.ServePacketConn(serveCtx, conn)
 }
 

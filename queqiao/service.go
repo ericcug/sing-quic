@@ -15,7 +15,8 @@ type DestinationDialer = pep.DestinationDialer
 
 type ServiceOptions struct {
 	ListenAddr        string
-	Users             []string
+	Authenticator     func(auth string) (user string, ok bool)
+	Users             []string // fallback if Authenticator is nil
 	TLSConfig         *tls.Config
 	Logger            *slog.Logger
 	MaxSessions       int
@@ -36,12 +37,13 @@ func NewService(opts ServiceOptions) (*Service, error) {
 	if opts.TLSConfig == nil {
 		return nil, errors.New("queqiao: TLSConfig is required for service")
 	}
-	if len(opts.Users) == 0 {
-		return nil, errors.New("queqiao: at least one user password is required")
+	if opts.Authenticator == nil && len(opts.Users) == 0 {
+		return nil, errors.New("queqiao: at least one user password or Authenticator is required")
 	}
 
 	pepCfg := pep.ServerConfig{
 		ListenAddr:        opts.ListenAddr,
+		Authenticator:     opts.Authenticator,
 		Passwords:         opts.Users,
 		TLSConfig:         opts.TLSConfig,
 		Logger:            opts.Logger,
@@ -82,4 +84,9 @@ func (s *Service) Close() error {
 		return s.pepServer.Close()
 	}
 	return nil
+}
+
+// UserFromContext returns the authenticated username from the context.
+func UserFromContext(ctx context.Context) string {
+	return pep.UserFromContext(ctx)
 }

@@ -23,6 +23,14 @@ import (
 	"github.com/sagernet/sing-quic/queqiao/internal/session"
 )
 
+type userContextKey struct{}
+
+// UserFromContext returns the authenticated username from the context.
+func UserFromContext(ctx context.Context) string {
+	user, _ := ctx.Value(userContextKey{}).(string)
+	return user
+}
+
 // Must exceed the client's bounded lane-replacement wait so a final-ACK loss
 // can still be repaired after QUIC dead-path detection and scheduler backoff.
 // Tombstones retain only final sequence metadata and remain bounded by the
@@ -428,6 +436,7 @@ func (s *Server) handleQUIC(ctx context.Context, conn *quic.Conn) {
 }
 
 func (s *Server) handleSession(ctx context.Context, conn streamConn, user string, auth *quicAuthState) {
+	ctx = context.WithValue(ctx, userContextKey{}, user)
 	defer conn.Close()
 	if auth != nil {
 		auth.flows.Add(1)

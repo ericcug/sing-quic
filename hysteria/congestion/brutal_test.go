@@ -38,9 +38,9 @@ func TestBrutalSenderCongestionControlEx(t *testing.T) {
 
 	// Initial cwnd check
 	// cwnd = bps * rtt * multiplier / ackRate
-	// 10MB/s * 0.05s * 4 / 1.0 = 2097152 bytes
+	// 10MB/s * 0.05s * 2 / 1.0 = 1048576 bytes
 	initialCwnd := bs.GetCongestionWindow()
-	expectedInitial := congestion.ByteCount(2097152)
+	expectedInitial := congestion.ByteCount(1048576)
 	if initialCwnd != expectedInitial {
 		t.Fatalf("expected initial cwnd %d, got %d", expectedInitial, initialCwnd)
 	}
@@ -55,9 +55,9 @@ func TestBrutalSenderCongestionControlEx(t *testing.T) {
 		t.Fatalf("expected ackRate 0.8, got %f", bs.ackRate)
 	}
 
-	// cwnd should now expand: 2097152 / 0.8 = 2621440 bytes
+	// cwnd should now expand: 1048576 / 0.8 = 1310720 bytes
 	newCwnd := bs.GetCongestionWindow()
-	expectedNew := congestion.ByteCount(2621440)
+	expectedNew := congestion.ByteCount(1310720)
 	if newCwnd != expectedNew {
 		t.Fatalf("expected new cwnd %d, got %d", expectedNew, newCwnd)
 	}

@@ -92,10 +92,6 @@ type Server struct {
 	refusals         recordLimiter
 	budget           *limiter.Budget
 	metrics          *metrics.Registry
-	// udpRelays holds the relay sockets of UDP associations whose lane died,
-	// so the replacement association keeps the source address the destination
-	// has been talking to.
-	udpRelays *udpRelayStore
 }
 
 type serverFlow struct {
@@ -229,7 +225,7 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		cfg.ProviderID = "queqiao"
 	}
 	if cfg.DestinationPolicy == nil {
-		cfg.DestinationPolicy = DestinationPolicy{AllowPrivate: true}
+		cfg.DestinationPolicy = &directDestinationPolicy{policy: DestinationPolicy{AllowPrivate: true}}
 	}
 	budget := limiter.New(limiter.Config{TotalBytesPerSec: cfg.AggregateBytesPerSec, ReserveBytesPerSec: cfg.InteractiveReserveBytesPerSec})
 	cfg.ChunkSize = chunkSizeForBudget(cfg.ChunkSize, budget)
@@ -240,7 +236,6 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		sessions:    make(map[[16]byte]*serverFlow),
 		budget:      budget,
 		metrics:     cfg.Metrics,
-		udpRelays:   newUDPRelayStore(),
 	}
 	return server, nil
 }
@@ -256,42 +251,37 @@ func (s *Server) Serve(ctx context.Context) error {
 }
 
 func (s *Server) serveQUIC(ctx context.Context) error {
-	if s.cfg.HopPortCount < 2 {
-		// Fast path: single port, no mux overhead.
-		packetConn, err := net.ListenPacket("udp", s.cfg.ListenAddr)
-		if err != nil {
-			return fmt.Errorf("listen on remote QUIC address: %w", err)
-		}
-		return s.ServePacketConn(ctx, packetConn)
-	}
-
-	// Port-hopping path: bind the primary socket, derive the port list, then
-	// open secondary sockets and hand everything to a ServerPortMux.
-	listenAddr, err := net.ResolveUDPAddr("udp", s.cfg.ListenAddr)
-	if err != nil {
-		return fmt.Errorf("resolve QUIC listen address: %w", err)
-	}
-	primaryConn, err := net.ListenUDP("udp", listenAddr)
+	packetConn, err := net.ListenPacket("udp", s.cfg.ListenAddr)
 	if err != nil {
 		return fmt.Errorf("listen on remote QUIC address: %w", err)
 	}
-	primaryPort := primaryConn.LocalAddr().(*net.UDPAddr).Port
-	ports := portmux.HopPorts(s.cfg.ProviderID, primaryPort, s.cfg.HopPortCount)
-	mux, err := portmux.NewServerPortMux(primaryConn, ports)
-	if err != nil {
-		_ = primaryConn.Close()
-		return fmt.Errorf("create server port mux: %w", err)
-	}
-	s.cfg.Logger.Info("port hop listener ready",
-		"primary_addr", primaryConn.LocalAddr(),
-		"hop_port_count", len(ports)-len(mux.SkippedPorts()),
-		"hop_ports_configured", len(ports),
-		"hop_ports_unavailable", mux.SkippedPorts())
-	return s.ServePacketConn(ctx, mux)
+	return s.ServePacketConn(ctx, packetConn)
 }
 
 // ServePacketConn runs the QUIC listener on an already-bound UDP socket.
 func (s *Server) ServePacketConn(ctx context.Context, packetConn net.PacketConn) error {
+	if s.cfg.HopPortCount > 1 {
+		// Hop sockets are bound here rather than in a caller, because only the
+		// socket's own address names the port list both peers derive. A host
+		// that supplies an already-bound socket still gets the full pool.
+		if udpConn, isUDP := packetConn.(*net.UDPConn); isUDP {
+			primaryPort := udpConn.LocalAddr().(*net.UDPAddr).Port
+			ports := portmux.HopPorts(s.cfg.ProviderID, primaryPort, s.cfg.HopPortCount)
+			mux, muxErr := portmux.NewServerPortMux(udpConn, ports)
+			if muxErr == nil {
+				s.cfg.Logger.Info("port hop listener ready",
+					"primary_addr", udpConn.LocalAddr(),
+					"hop_port_count", len(ports)-len(mux.SkippedPorts()),
+					"hop_ports_configured", len(ports),
+					"hop_ports_unavailable", mux.SkippedPorts())
+				packetConn = mux
+			} else {
+				s.cfg.Logger.Error("failed to create port mux; serving the primary port only", "error", muxErr)
+			}
+		} else {
+			s.cfg.Logger.Warn("cannot enable port hop: connection is not a UDP socket")
+		}
+	}
 	listener, err := quic.Listen(packetConn, s.cfg.TLSConfig, quicServerConfig(
 		flowWindows{stream: s.cfg.StreamReceiveWindow, connection: s.cfg.ConnectionReceiveWindow}))
 	if err != nil {
@@ -309,7 +299,7 @@ func (s *Server) ServePacketConn(ctx context.Context, packetConn net.PacketConn)
 	for {
 		conn, acceptErr := listener.Accept(ctx)
 		if acceptErr != nil {
-			if ctx.Err() != nil {
+			if ctx.Err() != nil || errors.Is(acceptErr, net.ErrClosed) {
 				wg.Wait()
 				return nil
 			}
@@ -437,6 +427,9 @@ func (s *Server) handleQUIC(ctx context.Context, conn *quic.Conn) {
 
 func (s *Server) handleSession(ctx context.Context, conn streamConn, user string, auth *quicAuthState) {
 	ctx = context.WithValue(ctx, userContextKey{}, user)
+	if streamConn, isQUIC := conn.(*quicStreamConn); isQUIC && streamConn.conn != nil {
+		ctx = WithPeerAddr(ctx, streamConn.conn.RemoteAddr())
+	}
 	defer conn.Close()
 	if auth != nil {
 		auth.flows.Add(1)
@@ -475,11 +468,7 @@ func (s *Server) handleSession(ctx context.Context, conn streamConn, user string
 		return
 	}
 	if session.IsUDPAssociation(open.Payload) {
-		s.handleUDPAssociation(ctx, conn, fc, user, sessionID, open.Header.FlowID, nil, false)
-		return
-	}
-	if token, resumable := session.DecodeUDPResumeOpen(open.Payload); resumable {
-		s.handleUDPAssociation(ctx, conn, fc, user, sessionID, open.Header.FlowID, token, true)
+		s.handleUDPAssociation(ctx, conn, fc, user, sessionID, open.Header.FlowID)
 		return
 	}
 	destination, err := session.DecodeDestination(open.Payload)
@@ -488,10 +477,11 @@ func (s *Server) handleSession(ctx context.Context, conn streamConn, user string
 		return
 	}
 	destinationDialStarted := time.Now()
-	destinationConn, err := s.cfg.DestinationPolicy.DialContext(ctx, destination)
+	destinationConn, err := s.cfg.DestinationPolicy.DialContext(ctx, user, destination)
 	if err != nil {
 		_ = fc.Write(protocol.Frame{Header: protocol.Header{Version: protocol.Version, Type: protocol.TypeReset, SessionID: sessionID, FlowID: open.Header.FlowID, Class: protocol.ClassNew}, Payload: session.ResetPayload(session.ResetDestination, "destination unavailable")})
 		s.cfg.Logger.Debug("destination dial failed", "error", err)
+		_ = destinationConn
 		return
 	}
 	s.cfg.Logger.Debug("remote flow opened", "transport", transportKindForConn(conn), "user", user, "open_duration", destinationDialStarted.Sub(sessionStarted), "destination_dial_duration", time.Since(destinationDialStarted), "total_duration", time.Since(sessionStarted))
@@ -579,6 +569,12 @@ const (
 	maxPathProbeBytes  = protocol.MaxProbeBytes
 )
 
+// handlePathProbe accepts only a small, destination-free sequence and reflects
+// each validated frame exactly once. The equal-size authenticated echo cannot
+// amplify traffic or name a destination, and it gives this endpoint's own
+// congestion controller outbound packets to measure. That is the only sound
+// source for its sending direction; reverse-direction arrivals cannot reveal
+// which losses the peer caused by its offered rate.
 // handlePathProbe accepts only a small, destination-free sequence and reflects
 // each validated frame exactly once. The equal-size authenticated echo cannot
 // amplify traffic or name a destination, and it gives this endpoint's own

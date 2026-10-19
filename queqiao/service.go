@@ -3,129 +3,137 @@ package queqiao
 import (
 	"context"
 	"crypto/tls"
-	"errors"
 	"log/slog"
 	"net"
-	"time"
+	"sync"
 
 	"github.com/sagernet/sing-quic/queqiao/internal/pep"
-	"github.com/sagernet/sing-quic/queqiao/internal/portmux"
+	"github.com/sagernet/sing/common/auth"
+	"github.com/sagernet/sing/common/logger"
+	M "github.com/sagernet/sing/common/metadata"
+	N "github.com/sagernet/sing/common/network"
 )
 
-type DestinationDialer = pep.DestinationDialer
+// ServiceHandler receives the connections queqiao opens on the gateway's
+// behalf, once they are authenticated.
+type ServiceHandler interface {
+	N.TCPConnectionHandlerEx
+	N.UDPConnectionHandlerEx
+}
 
+// ServiceOptions configures a queqiao gateway. Transport tuning lives in the
+// queqiao core and follows its own defaults; only the deployment surface is
+// exposed here.
 type ServiceOptions struct {
-	ListenAddr        string
-	Authenticator     func(auth string) (user string, ok bool)
-	Users             []string // fallback if Authenticator is nil
-	TLSConfig         *tls.Config
-	Logger            *slog.Logger
-	MaxSessions       int
-	HandshakeTimeout  time.Duration
-	IdleTimeout       time.Duration
-	MaxLifetime       time.Duration
-	HopPortCount      int
-	UDPOnStream       bool
-	DestinationDialer DestinationDialer
+	Context       context.Context
+	Logger        logger.Logger
+	Users         []string
+	Authenticator func(auth string) (user string, ok bool)
+	TLSConfig     *tls.Config
+	HopPortCount  int
+	Handler       ServiceHandler
 }
 
 type Service struct {
-	pepServer    *pep.Server
-	cancel       context.CancelFunc
-	hopPortCount int
-	providerID   string
-	logger       *slog.Logger
+	core      *pep.Server
+	ctx       context.Context
+	cancel    context.CancelFunc
+	closeOnce sync.Once
+	logger    logger.Logger
+	handler   ServiceHandler
 }
 
-func NewService(opts ServiceOptions) (*Service, error) {
-	if opts.TLSConfig == nil {
-		return nil, errors.New("queqiao: TLSConfig is required for service")
+func NewService(options ServiceOptions) (*Service, error) {
+	if options.Context == nil {
+		options.Context = context.Background()
 	}
-	if opts.Authenticator == nil && len(opts.Users) == 0 {
-		return nil, errors.New("queqiao: at least one user password or Authenticator is required")
+	if options.Logger == nil {
+		options.Logger = logger.NOP()
 	}
-
-	pepCfg := pep.ServerConfig{
-		ListenAddr:        opts.ListenAddr,
-		Authenticator:     opts.Authenticator,
-		Passwords:         opts.Users,
-		TLSConfig:         opts.TLSConfig,
-		Logger:            opts.Logger,
-		MaxSessions:       opts.MaxSessions,
-		HandshakeTimeout:  opts.HandshakeTimeout,
-		FlowIdleTimeout:   opts.IdleTimeout,
-		FlowMaxLifetime:   opts.MaxLifetime,
-		HopPortCount:      opts.HopPortCount,
-		UDPOnStream:       opts.UDPOnStream,
-		DestinationPolicy: opts.DestinationDialer,
+	if len(options.TLSConfig.NextProtos) == 0 {
+		options.TLSConfig.NextProtos = []string{pep.ALPN}
 	}
-
-	s, err := pep.NewServer(pepCfg)
+	serviceCtx, cancel := context.WithCancel(options.Context)
+	service := &Service{
+		ctx:     serviceCtx,
+		cancel:  cancel,
+		logger:  options.Logger,
+		handler: options.Handler,
+	}
+	core, err := pep.NewServer(pep.ServerConfig{
+		TLSConfig:         options.TLSConfig,
+		Authenticator:     options.Authenticator,
+		Passwords:         options.Users,
+		HopPortCount:      options.HopPortCount,
+		DestinationPolicy: service,
+		Logger:            slog.New(&slogHandler{logger: options.Logger}),
+	})
 	if err != nil {
 		return nil, err
 	}
-
-	return &Service{
-		pepServer:    s,
-		hopPortCount: opts.HopPortCount,
-		logger:       opts.Logger,
-	}, nil
+	service.core = core
+	return service, nil
 }
 
-func (s *Service) Serve(ctx context.Context) error {
-	serveCtx, cancel := context.WithCancel(ctx)
-	s.cancel = cancel
-	return s.pepServer.Serve(serveCtx)
+// Start runs the gateway on an already-bound socket until ctx is cancelled.
+func (s *Service) Start(packetConn net.PacketConn) error {
+	return s.core.ServePacketConn(s.ctx, packetConn)
 }
 
-func (s *Service) ServePacketConn(ctx context.Context, conn net.PacketConn) error {
-	serveCtx, cancel := context.WithCancel(ctx)
-	s.cancel = cancel
-
-	if s.hopPortCount > 1 {
-		if udpConn, ok := conn.(*net.UDPConn); ok {
-			primaryPort := udpConn.LocalAddr().(*net.UDPAddr).Port
-			providerID := s.providerID
-			if providerID == "" {
-				providerID = "queqiao"
-			}
-			ports := portmux.HopPorts(providerID, primaryPort, s.hopPortCount)
-			mux, err := portmux.NewServerPortMux(udpConn, ports)
-			if err == nil {
-				if s.logger != nil {
-					s.logger.Info("port hop listener ready",
-						"primary_addr", udpConn.LocalAddr(),
-						"hop_port_count", len(ports)-len(mux.SkippedPorts()),
-						"hop_ports_configured", len(ports),
-						"hop_ports_unavailable", mux.SkippedPorts())
-				}
-				conn = mux
-			} else {
-				if s.logger != nil {
-					s.logger.Error("failed to create port mux", "error", err.Error())
-				}
-			}
-		} else {
-			if s.logger != nil {
-				s.logger.Warn("cannot enable port hop: connection is not *net.UDPConn")
-			}
-		}
-	}
-
-	return s.pepServer.ServePacketConn(serveCtx, conn)
-}
-
+// Close stops accepting connections, tears down the flows in flight and
+// releases the listener's serve loop.
 func (s *Service) Close() error {
-	if s.cancel != nil {
+	s.closeOnce.Do(func() {
 		s.cancel()
-	}
-	if s.pepServer != nil {
-		return s.pepServer.Close()
-	}
-	return nil
+	})
+	return s.core.Close()
 }
 
-// UserFromContext returns the authenticated username from the context.
-func UserFromContext(ctx context.Context) string {
-	return pep.UserFromContext(ctx)
+func (s *Service) DialContext(ctx context.Context, user string, destination string) (net.Conn, error) {
+	input, output := pep.NewStreamPipe()
+	var source M.Socksaddr
+	if remote := s.remoteAddr(ctx); remote != nil {
+		source = M.SocksaddrFromNet(remote).Unwrap()
+	}
+	go s.handler.NewConnectionEx(
+		auth.ContextWithUser(ctx, user),
+		output,
+		source,
+		M.ParseSocksaddr(destination).Unwrap(),
+		N.OnceClose(func(it error) {
+			input.Close()
+		}),
+	)
+	return input, nil
 }
+
+func (s *Service) ListenPacket(ctx context.Context, user string) (N.PacketConn, error) {
+	left, right := newPacketPipe()
+	var source M.Socksaddr
+	if remote := s.remoteAddr(ctx); remote != nil {
+		source = M.SocksaddrFromNet(remote).Unwrap()
+	}
+	go s.handler.NewPacketConnectionEx(
+		auth.ContextWithUser(ctx, user),
+		right,
+		source,
+		M.Socksaddr{},
+		N.OnceClose(func(it error) {
+			_ = left.Close()
+		}),
+	)
+	return left, nil
+}
+
+// remoteAddr is the client's address on the authenticated connection the
+// flow arrived on, which is what a source rule matches against. It is read
+// from the per-flow context, so it names the connection this flow uses rather
+// than the gateway's listening socket.
+func (s *Service) remoteAddr(ctx context.Context) net.Addr {
+	return pep.PeerAddr(ctx)
+}
+
+// ALPN is the application protocol every queqiao peer negotiates.
+const ALPN = pep.ALPN
+
+var _ pep.DestinationDialer = (*Service)(nil)

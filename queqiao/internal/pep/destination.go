@@ -8,11 +8,86 @@ import (
 	"net/netip"
 	"strconv"
 	"time"
+
+	"github.com/sagernet/sing-quic/queqiao/internal/session"
+	"github.com/sagernet/sing/common/buf"
+	M "github.com/sagernet/sing/common/metadata"
+	N "github.com/sagernet/sing/common/network"
 )
 
+// directDestinationPolicy is the standalone gateway's own dialer. An embedding
+// host supplies its own so flows follow its routing.
+type directDestinationPolicy struct {
+	policy DestinationPolicy
+}
+
+func (p *directDestinationPolicy) DialContext(ctx context.Context, _ string, destination string) (net.Conn, error) {
+	return p.policy.DialContext(ctx, destination)
+}
+
+func (p *directDestinationPolicy) ListenPacket(ctx context.Context, _ string) (N.PacketConn, error) {
+	conn, err := net.ListenUDP("udp", nil)
+	if err != nil {
+		return nil, err
+	}
+	return &directPacketConn{conn: conn, policy: p.policy}, nil
+}
+
+type directPacketConn struct {
+	conn   *net.UDPConn
+	policy DestinationPolicy
+}
+
+func (c *directPacketConn) ReadPacket(buffer *buf.Buffer) (M.Socksaddr, error) {
+	for {
+		n, addr, err := c.conn.ReadFromUDP(buffer.FreeBytes())
+		if err != nil {
+			return M.Socksaddr{}, err
+		}
+		destination, err := session.DestinationFromUDPAddr(addr)
+		if err != nil {
+			continue
+		}
+		buffer.Truncate(int(n))
+		return M.ParseSocksaddr(destination), nil
+	}
+}
+
+func (c *directPacketConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
+	defer buffer.Release()
+	addresses, err := c.policy.ResolveUDPAddr(context.Background(), destination.String())
+	if err != nil {
+		return err
+	}
+	for _, address := range addresses {
+		_, err = c.conn.WriteToUDP(buffer.Bytes(), address)
+		if err == nil {
+			return nil
+		}
+	}
+	return err
+}
+
+func (c *directPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
+	return c.conn.ReadFrom(p)
+}
+
+func (c *directPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
+	return c.conn.WriteTo(p, addr)
+}
+
+func (c *directPacketConn) Close() error                       { return c.conn.Close() }
+func (c *directPacketConn) LocalAddr() net.Addr                { return c.conn.LocalAddr() }
+func (c *directPacketConn) SetDeadline(t time.Time) error      { return c.conn.SetDeadline(t) }
+func (c *directPacketConn) SetReadDeadline(t time.Time) error  { return c.conn.SetReadDeadline(t) }
+func (c *directPacketConn) SetWriteDeadline(t time.Time) error { return c.conn.SetWriteDeadline(t) }
+
+// DestinationDialer opens the application connections a flow carries. The
+// authenticated user is passed so an embedding router can attribute the flow.
+// A packet connection is one association: packets name their own destination.
 type DestinationDialer interface {
-	DialContext(ctx context.Context, destination string) (net.Conn, error)
-	ResolveUDPAddr(ctx context.Context, destination string) ([]*net.UDPAddr, error)
+	DialContext(ctx context.Context, user string, destination string) (net.Conn, error)
+	ListenPacket(ctx context.Context, user string) (N.PacketConn, error)
 }
 
 type DestinationPolicy struct {
@@ -93,10 +168,8 @@ func (p DestinationPolicy) DialContext(ctx context.Context, destination string) 
 	return nil, fmt.Errorf("destination unavailable: %w", lastErr)
 }
 
-// ResolveUDPAddr validates and resolves a destination using exactly the same
-// public-address policy as TCP CONNECT. It deliberately returns a concrete
-// address: the server performs DNS resolution at the US egress and does not
-// let the client influence a later DNS rebinding or private-address hop.
+// ResolveUDPAddr validates and resolves a destination using the same
+// public-address policy as TCP, returning concrete addresses only.
 func (p DestinationPolicy) ResolveUDPAddr(ctx context.Context, destination string) ([]*net.UDPAddr, error) {
 	host, port, err := parseDestination(destination)
 	if err != nil {
@@ -157,4 +230,21 @@ func publicDestinationIP(ip net.IP) bool {
 		}
 	}
 	return true
+}
+
+type peerAddrKey struct{}
+
+// WithPeerAddr records the authenticated connection's peer address for the
+// flows it carries, so a host can attribute them to a client.
+func WithPeerAddr(ctx context.Context, addr net.Addr) context.Context {
+	if addr == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, peerAddrKey{}, addr)
+}
+
+// PeerAddr returns the address recorded by WithPeerAddr.
+func PeerAddr(ctx context.Context) net.Addr {
+	addr, _ := ctx.Value(peerAddrKey{}).(net.Addr)
+	return addr
 }

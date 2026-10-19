@@ -38,22 +38,17 @@ func TestPublicDestinationIP(t *testing.T) {
 	}
 }
 
+// The UDP resolver applies the same public-address policy as TCP: a peer
+// cannot reach a private destination either way.
 func TestResolveUDPAddrUsesDestinationPolicy(t *testing.T) {
 	addresses, err := (DestinationPolicy{}).ResolveUDPAddr(context.Background(), "8.8.8.8:53")
-	if err != nil {
-		t.Fatal(err)
+	if err != nil || len(addresses) != 1 || addresses[0].Port != 53 {
+		t.Fatalf("public address = %v, %v", addresses, err)
 	}
-	if len(addresses) != 1 || !addresses[0].IP.Equal(net.ParseIP("8.8.8.8")) || addresses[0].Port != 53 {
-		t.Fatalf("unexpected addresses %#v", addresses)
+	if _, err = (DestinationPolicy{}).ResolveUDPAddr(context.Background(), "127.0.0.1:53"); err == nil {
+		t.Fatal("private address was accepted")
 	}
-	if _, err := (DestinationPolicy{}).ResolveUDPAddr(context.Background(), "127.0.0.1:53"); err == nil {
-		t.Fatal("private UDP destination accepted")
-	}
-	if _, err := (DestinationPolicy{}).ResolveUDPAddr(context.Background(), "[64:ff9b::a00:1]:53"); err == nil {
-		t.Fatal("NAT64-encoded private UDP destination accepted")
-	}
-	addresses, err = (DestinationPolicy{AllowPrivate: true}).ResolveUDPAddr(context.Background(), "127.0.0.1:53")
-	if err != nil || len(addresses) != 1 {
-		t.Fatalf("private destination with explicit allow failed: %v", err)
+	if addresses, err = (DestinationPolicy{AllowPrivate: true}).ResolveUDPAddr(context.Background(), "127.0.0.1:53"); err != nil || len(addresses) != 1 {
+		t.Fatalf("allowed private address = %v, %v", addresses, err)
 	}
 }

@@ -305,7 +305,7 @@ type multipathFlow struct {
 	// -- while a flow with a full send window and no acknowledgements is
 	// making no progress long before that. The watchdog measures progress
 	// where delivery to the peer is actually recorded (the acknowledged send
-	// offset and payload arrival) and, finding none while work is pending,
+	// offset) and, finding none while work is pending,
 	// demotes the lane and asks for a rescue beside it. Nothing here closes
 	// anything: suspected lanes keep receiving, and recover their full
 	// eligibility on the first acknowledgement they carry.
@@ -314,13 +314,6 @@ type multipathFlow struct {
 	// no lock, and in particular never touches lanesMu while holding chunkMu
 	// or replayMu.
 	lastAckProgressNS atomic.Int64
-	lastUpPayloadNS   atomic.Int64
-	lastDownPayloadNS atomic.Int64
-	// upAtLastDown is bytesUp at the moment the last downstream payload
-	// arrived. bytesUp above it means the application sent something the
-	// peer has not answered yet, which is the watchdog's "outstanding
-	// request" gate for flows waiting on a response.
-	upAtLastDown atomic.Uint64
 	// minRTTNS is the smallest controller minimum-RTT the flow's lanes have
 	// reported, refreshed by observeTransport. The stall threshold is three
 	// of these.
@@ -1782,17 +1775,6 @@ func (f *multipathFlow) pendingOutbound() bool {
 	return pending
 }
 
-// responseOutstanding reports whether the flow is waiting on an answer: the
-// application sent something since the last downstream payload arrived, and
-// neither side has closed. An idle conversation fails this test because its
-// last send was answered, so waiting on one never triggers the watchdog.
-func (f *multipathFlow) responseOutstanding() bool {
-	if f.remoteFinSeen.Load() || f.finSent.Load() || f.localAbortSent.Load() {
-		return false
-	}
-	return f.bytesUp.Load() > f.upAtLastDown.Load()
-}
-
 // scanStall advances one pending/progress pair and reports whether the pair
 // has now been pending without progress for the threshold. The clock starts
 // when pending is first observed and restarts at every newer progress stamp,
@@ -1833,7 +1815,7 @@ func (f *multipathFlow) stallWatchdog(stop <-chan struct{}) {
 	}
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
-	var sendSince, responseSince time.Time
+	var sendSince time.Time
 	episode := false
 	var lastSignal time.Time
 	for {
@@ -1847,14 +1829,10 @@ func (f *multipathFlow) stallWatchdog(stop <-chan struct{}) {
 		now := time.Now()
 		threshold := f.stallThreshold()
 		stalledSend := scanStall(f.pendingOutbound(), f.lastAckProgressNS.Load(), now, threshold, &sendSince)
-		var responseBase int64
-		if down, up := f.lastDownPayloadNS.Load(), f.lastUpPayloadNS.Load(); down > up {
-			responseBase = down
-		} else {
-			responseBase = up
-		}
-		stalledResponse := scanStall(f.responseOutstanding(), responseBase, now, threshold, &responseSince)
-		if !stalledSend && !stalledResponse {
+		// Application bytes do not imply a response: TLS, HTTP/2 control
+		// messages, uploads and slow origins can legitimately be silent after
+		// delivery. Only unacknowledged transport work justifies lane rescue.
+		if !stalledSend {
 			episode = false
 			continue
 		}
@@ -1870,7 +1848,7 @@ func (f *multipathFlow) stallWatchdog(stop <-chan struct{}) {
 			if f.logger != nil {
 				f.logger.Info("flow stall suspected; lane demoted and rescue requested",
 					"flow_id", f.flowID, "threshold", threshold,
-					"send_stalled", stalledSend, "response_stalled", stalledResponse,
+					"send_stalled", stalledSend,
 					"healthy_spare", spare, "lanes", f.laneCount(),
 					"bytes_up", f.bytesUp.Load(), "bytes_down", f.bytesDown.Load())
 			}
@@ -2704,7 +2682,18 @@ func (f *multipathFlow) receiveInner(ctx context.Context) error {
 			switch frame.Header.Type {
 			case protocol.TypeData:
 				if remoteFin {
-					return errors.New("data received after flow FIN")
+					// Recovery can replay already-delivered bytes on a lane
+					// whose delivery trails the FIN on another lane. Accept
+					// only a nonempty duplicate wholly before the final offset;
+					// subtraction keeps the bounds check safe from overflow.
+					final := reassembler.NextSequence()
+					if len(frame.Payload) == 0 || frame.Header.Sequence > final || uint64(len(frame.Payload)) > final-frame.Header.Sequence {
+						return errors.New("data received after flow FIN")
+					}
+					if err := f.acknowledgeRemoteFIN(ctx, final, false); err != nil {
+						return err
+					}
+					continue
 				}
 				out, closed, err := reassembler.Insert(multipath.Segment{Sequence: frame.Header.Sequence, Payload: frame.Payload})
 				if err != nil {
@@ -2957,19 +2946,8 @@ func (f *multipathFlow) observe(n int, up bool) bool {
 	downBytes := f.bytesDown.Load()
 	if up {
 		upBytes += uint64(n)
-		if n > 0 {
-			f.lastUpPayloadNS.Store(now.UnixNano())
-		}
 	} else {
 		downBytes += uint64(n)
-		// n == 0 is refreshClass re-examining what was already carried, not
-		// an arrival: only real payload answers what was sent.
-		if n > 0 {
-			f.lastDownPayloadNS.Store(now.UnixNano())
-			// A downstream payload answers everything sent so far. Anything
-			// sent after this point is a request the peer has not answered yet.
-			f.upAtLastDown.Store(upBytes)
-		}
 	}
 	recentUp, recentDown := f.recentBytes(now, n, up)
 	obs := classifier.Observation{

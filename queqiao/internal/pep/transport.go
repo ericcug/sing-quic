@@ -22,6 +22,8 @@ import (
 	"github.com/sagernet/sing-quic/queqiao/internal/netbind"
 	"github.com/sagernet/sing-quic/queqiao/internal/portmux"
 	"github.com/sagernet/sing-quic/queqiao/internal/protocol"
+	M "github.com/sagernet/sing/common/metadata"
+	N "github.com/sagernet/sing/common/network"
 )
 
 type TransportKind string
@@ -36,6 +38,9 @@ const (
 // wire version in internal/protocol, because bumping one without the other is
 // the failure the pairing exists to prevent.
 const defaultALPN = protocol.DataALPN
+
+// ALPN is the application protocol every queqiao peer must negotiate.
+const ALPN = defaultALPN
 
 const (
 	defaultAdaptiveMinBytesPerSec = 64 * 1024
@@ -315,10 +320,13 @@ func handshakeBound(conn streamConn, configured time.Duration) time.Duration {
 }
 
 type quicStreamConn struct {
-	stream     quicBidiStream
-	conn       *quic.Conn
-	packet     net.PacketConn
-	controller wancongestion.TelemetryProvider
+	stream quicBidiStream
+	conn   *quic.Conn
+	// closeTransport releases the socket and connection this lane owns. When a
+	// lane is one stream of a connection created by the host, the host's
+	// closer is here instead and only this stream is discarded.
+	closeTransport func() error
+	controller     wancongestion.TelemetryProvider
 	// closeConn is true for a dedicated lane. Streams obtained from the
 	// client pool and streams accepted by the server must only close their
 	// stream; closing the connection would tear down unrelated flows.
@@ -395,13 +403,14 @@ func (c *quicStreamConn) Close() error {
 		c.stream.CancelRead(0)
 		err = c.CloseWrite()
 		if c.closeConn {
-			// Dedicated lanes own their QUIC connection and socket. Pooled
-			// streams deliberately leave both alive for other flows.
-			if closeErr := c.conn.CloseWithError(0, "queqiao lane closed"); closeErr != nil {
-				err = closeErr
-			}
-			if c.packet != nil {
-				_ = c.packet.Close()
+			if c.closeTransport != nil {
+				if closeErr := c.closeTransport(); closeErr != nil {
+					err = closeErr
+				}
+			} else if c.conn != nil {
+				if closeErr := c.conn.CloseWithError(0, "queqiao lane closed"); closeErr != nil {
+					err = closeErr
+				}
 			}
 		}
 	})
@@ -564,25 +573,50 @@ func quicConfig(windows flowWindows) *quic.Config {
 	}
 }
 
-func dialQUIC(ctx context.Context, remote string, tlsCfg *tls.Config, password string, dialTimeout time.Duration, localAddress string, control func(string, string, syscall.RawConn) error, observeTransientWrite func(error), ccfg congestionConfig, windows flowWindows, hop hopDialConfig) (streamConn, error) {
-	conn, packetConn, err := dialQUICConnection(ctx, remote, tlsCfg, password, dialTimeout, localAddress, control, observeTransientWrite, windows, hop)
+func dialQUIC(ctx context.Context, dialer N.Dialer, remote string, tlsCfg *tls.Config, password string, dialTimeout time.Duration, localAddress string, control func(string, string, syscall.RawConn) error, observeTransientWrite func(error), ccfg congestionConfig, windows flowWindows, hop hopDialConfig) (streamConn, error) {
+	conn, packetConn, err := dialQUICConnection(ctx, dialer, remote, tlsCfg, password, dialTimeout, localAddress, control, observeTransientWrite, windows, hop)
 	if err != nil {
 		return nil, err
+	}
+	closeTransport := func() error {
+		var err error
+		if closeErr := conn.CloseWithError(0, "queqiao lane closed"); closeErr != nil {
+			err = closeErr
+		}
+		if packetConn != nil {
+			_ = packetConn.Close()
+		}
+		return err
 	}
 	controller := configureQUICController(conn, ccfg)
 	stream, err := conn.OpenStreamSync(ctx)
 	if err != nil {
-		_ = conn.CloseWithError(0, "unable to open queqiao stream")
-		if packetConn != nil {
-			_ = packetConn.Close()
-		}
+		_ = closeTransport()
 		return nil, err
 	}
 	return &quicStreamConn{
-		stream: stream, conn: conn, packet: packetConn, controller: controller,
+		stream: stream, conn: conn, closeTransport: closeTransport, controller: controller,
 		closeConn: true, bulk: connBulkPath(conn, windows.codedQueue),
 	}, nil
 }
+
+// connectedPacketConn presents a connected UDP socket as a net.PacketConn,
+// which is the shape QUIC wants: reads and writes name the same peer.
+type connectedPacketConn struct {
+	net.Conn
+	remoteAddr *net.UDPAddr
+}
+
+func (c *connectedPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
+	n, err := c.Read(p)
+	return n, c.remoteAddr, err
+}
+
+func (c *connectedPacketConn) WriteTo(p []byte, _ net.Addr) (int, error) {
+	return c.Write(p)
+}
+
+func (c *connectedPacketConn) RemoteAddr() net.Addr { return c.remoteAddr }
 
 // transientRoutePacketConn gives a short local route outage the same meaning
 // as a datagram lost in the network.
@@ -697,7 +731,7 @@ func transientRouteWriteError(err error) bool {
 // monitor for the per-port blocking pattern caused by GFW and trigger port
 // hops reactively. The mux's context is cancelled when the PacketConn is
 // closed, which stops the goroutine.
-func dialQUICConnection(ctx context.Context, remote string, tlsCfg *tls.Config, password string, dialTimeout time.Duration, localAddress string, control func(string, string, syscall.RawConn) error, observeTransientWrite func(error), windows flowWindows, hop hopDialConfig) (*quic.Conn, net.PacketConn, error) {
+func dialQUICConnection(ctx context.Context, dialer N.Dialer, remote string, tlsCfg *tls.Config, password string, dialTimeout time.Duration, localAddress string, control func(string, string, syscall.RawConn) error, observeTransientWrite func(error), windows flowWindows, hop hopDialConfig) (*quic.Conn, net.PacketConn, error) {
 	dialCtx := ctx
 	var cancel context.CancelFunc
 	if dialTimeout > 0 {
@@ -726,13 +760,37 @@ func dialQUICConnection(ctx context.Context, remote string, tlsCfg *tls.Config, 
 		composed = composeSocketControls(netbind.InterfaceControl(result.InterfaceName), control)
 		resolver = netbind.ResolverForResult(result, control)
 	}
-	remoteAddr, err := resolveUDPAddr(dialCtx, remote, resolver)
-	if err != nil {
-		return nil, nil, err
-	}
-	packetConn, err := (&net.ListenConfig{Control: composed}).ListenPacket(dialCtx, "udp", listenAddress)
-	if err != nil {
-		return nil, nil, err
+	var (
+		packetConn net.PacketConn
+		remoteAddr *net.UDPAddr
+	)
+	if dialer != nil && hop.portCount < 2 {
+		// The host's dialer resolves the endpoint, applies its routing marks
+		// and bindings, and follows a detour. A connected socket is the shape
+		// it returns, and QUIC only needs it to name the same peer for reads
+		// and writes.
+		udpConn, dialErr := dialer.DialContext(dialCtx, N.NetworkUDP, M.ParseSocksaddr(remote).Unwrap())
+		if dialErr != nil {
+			return nil, nil, dialErr
+		}
+		addr, isUDPAddr := udpConn.RemoteAddr().(*net.UDPAddr)
+		if !isUDPAddr {
+			_ = udpConn.Close()
+			return nil, nil, fmt.Errorf("queqiao: dialer returned a non-UDP peer %v", udpConn.RemoteAddr())
+		}
+		remoteAddr = addr
+		packetConn = &connectedPacketConn{Conn: udpConn, remoteAddr: addr}
+	} else {
+		resolved, resolveErr := resolveUDPAddr(dialCtx, remote, resolver)
+		if resolveErr != nil {
+			return nil, nil, resolveErr
+		}
+		remoteAddr = resolved
+		listenErr := error(nil)
+		packetConn, listenErr = (&net.ListenConfig{Control: composed}).ListenPacket(dialCtx, "udp", listenAddress)
+		if listenErr != nil {
+			return nil, nil, listenErr
+		}
 	}
 	if hop.portCount >= 2 {
 		// Wrap the raw UDP socket with bidirectional port rewriting. The mux

@@ -138,7 +138,7 @@ func (c *Client) onUplinkChanged(ctx context.Context) {
 	// it survives by migrating, its congestion state, its erasure floor and
 	// its bottleneck all describe the old path.
 	c.closeQUICPool()
-	c.prewarmPath(ctx)
+	go c.prewarmPath(ctx)
 }
 
 // prewarmPath opens a connection for the sake of what opening one measures.

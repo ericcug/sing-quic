@@ -941,14 +941,16 @@ func TestReadLaneTreatsEOFAfterRemoteResetAsProtocolTeardown(t *testing.T) {
 		_ = peer.Close()
 	}()
 
+	// RESET now bypasses application delivery, including a full event queue.
 	select {
-	case event := <-flow.events:
-		if event.frame.Header.Type != protocol.TypeReset {
-			t.Fatalf("reader delivered frame type %d, want RESET", event.frame.Header.Type)
+	case err := <-flow.ackErr:
+		if err == nil || err.Error() != "peer reset flow" {
+			t.Fatalf("unexpected RESET result: %v", err)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for peer RESET")
 	}
+
 	if err := <-writeDone; err != nil {
 		t.Fatal(err)
 	}

@@ -39,13 +39,6 @@ const (
 
 	maxLaneRecoveryAttempts = 8
 	laneRecoveryResetAfter  = 5 * time.Minute
-	// laneJoinCapacityTCPCommit is how many consecutive capacity answers a
-	// recovery path takes before it stops believing the answer is transient.
-	// One or two in a row are the ordinary losers of a rescue race; at three
-	// the likelier reading is an admission slot wedged on the peer, and the
-	// AUTO TCP commit -- deliberately suppressed for a fresh answer, since a
-	// QUIC sibling may already hold the lane -- becomes the flow's escape.
-	laneJoinCapacityTCPCommit = 3
 	// A rejected speculative lane must not be reopened on every scheduler tick.
 	// The backoff is intentionally shorter than a normal bulk request timeout,
 	// but long enough to collect a fresh throughput/RTT sample on the surviving
@@ -1603,7 +1596,6 @@ func (c *Client) manageQUICLanes(ctx context.Context, flow *multipathFlow, sessi
 	var isolationBlockedUntil time.Time
 	var isolationBackoff time.Duration
 	isolationAttempts := 0
-	var stallBackoff time.Duration
 	var nextStallRescue time.Time
 	for {
 		select {
@@ -1650,21 +1642,10 @@ func (c *Client) manageQUICLanes(ctx context.Context, flow *multipathFlow, sessi
 				if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 					c.cfg.Logger.Warn("stall rescue unavailable", "flow_id", flowID, "error", err)
 				}
-				if stallBackoff == 0 {
-					stallBackoff = time.Second
-				} else if stallBackoff < 15*time.Second {
-					stallBackoff *= 2
-					if stallBackoff > 15*time.Second {
-						stallBackoff = 15 * time.Second
-					}
-				}
-				nextStallRescue = time.Now().Add(stallBackoff)
-			} else {
-				// A fresh lane must prove itself before the next round of
-				// dials; the watchdog will re-signal if the stall is real.
-				stallBackoff = 0
-				nextStallRescue = time.Now().Add(time.Second)
 			}
+			// The watchdog already paces pending-work rescue by measured RTT.
+			// Do not stack exponential sleeps on top of handshake timeouts.
+			nextStallRescue = time.Now().Add(flow.stallThreshold())
 		case <-ticker.C:
 			// The remote completion watcher can close its lanes just before
 			// this scheduler tick. Both FIN directions are already known at

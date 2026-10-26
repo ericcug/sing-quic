@@ -132,9 +132,9 @@ func (directHandler) NewPacketConnectionEx(ctx context.Context, conn N.PacketCon
 				if err != nil {
 					return
 				}
-				packetBuffer := buf.As(buffer[:n])
+				packetBuffer := buf.NewSize(n)
+				_, _ = packetBuffer.Write(buffer[:n])
 				if conn.WritePacket(packetBuffer, M.SocksaddrFromNet(addr).Unwrap()) != nil {
-					packetBuffer.Release()
 					return
 				}
 			}

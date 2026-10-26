@@ -263,12 +263,25 @@ type ServerPortMux struct {
 	skipped []int
 	// incoming is the merged receive queue. It is sized large enough to absorb
 	// bursts across all sockets without a secondary blocking a primary read.
-	incoming  chan serverPacket
-	routes    sync.Map // string(client addr) → *net.UDPConn
-	done      chan struct{}
+	incoming chan serverPacket
+	// routesMu guards current and previous, a two-generation bounded table
+	// mapping a client address to the socket it last arrived on. Every
+	// unauthenticated datagram names its own source, so an unbounded table is
+	// memory any spoofed packet can claim; when the active generation fills,
+	// it becomes the previous one and a fresh map starts. An active peer's
+	// next packet promotes it back, and a missing entry falls back to the
+	// primary socket, which is already what pickConn does.
+	routesMu sync.RWMutex
+	current  map[string]*net.UDPConn
+	previous map[string]*net.UDPConn
+	done     chan struct{}
 	closeOnce sync.Once
 	wg        sync.WaitGroup
 }
+
+// maxServerRoutes bounds one generation of the return-socket table. Two
+// generations live at once, so at most twice this many addresses are held.
+const maxServerRoutes = 4096
 
 // NewServerPortMux binds additional sockets on ports[1:] on the same IP as
 // primary, starts per-socket reader goroutines, and returns the multiplexed
@@ -366,10 +379,42 @@ func (m *ServerPortMux) readSocket(conn *net.UDPConn) {
 // pickConn returns the socket most recently used by addr, falling back to the
 // primary socket if no mapping exists.
 func (m *ServerPortMux) pickConn(addr *net.UDPAddr) *net.UDPConn {
-	if v, ok := m.routes.Load(addr.String()); ok {
-		return v.(*net.UDPConn)
+	key := addr.String()
+	m.routesMu.RLock()
+	conn := m.current[key]
+	if conn == nil {
+		conn = m.previous[key]
+	}
+	m.routesMu.RUnlock()
+	if conn != nil {
+		return conn
 	}
 	return m.primary
+}
+
+func (m *ServerPortMux) rememberRoute(addr *net.UDPAddr, conn *net.UDPConn) {
+	if addr == nil || conn == nil {
+		return
+	}
+	// Primary is the default when no route is recorded, so only a hop socket
+	// needs an entry at all: an unauthenticated packet on the primary port
+	// then claims no slot in the table.
+	key := addr.String()
+	m.routesMu.Lock()
+	defer m.routesMu.Unlock()
+	if conn == m.primary {
+		delete(m.current, key)
+		delete(m.previous, key)
+		return
+	}
+	if m.current == nil {
+		m.current = make(map[string]*net.UDPConn)
+	}
+	if _, exists := m.current[key]; !exists && len(m.current) >= maxServerRoutes {
+		m.previous = m.current
+		m.current = make(map[string]*net.UDPConn)
+	}
+	m.current[key] = conn
 }
 
 // — net.PacketConn —
@@ -384,7 +429,7 @@ func (m *ServerPortMux) ReadFrom(b []byte) (int, net.Addr, error) {
 			return 0, nil, net.ErrClosed
 		}
 		n := copy(b, pkt.data)
-		m.routes.Store(pkt.src.String(), pkt.conn)
+		m.rememberRoute(pkt.src, pkt.conn)
 		return n, pkt.src, nil
 	case <-m.done:
 		return 0, nil, net.ErrClosed
@@ -455,5 +500,13 @@ func (m *ServerPortMux) SetWriteDeadline(t time.Time) error {
 }
 
 func (m *ServerPortMux) SetReadBuffer(bytes int) error {
-	return m.primary.SetReadBuffer(bytes)
+	if err := m.primary.SetReadBuffer(bytes); err != nil {
+		return err
+	}
+	for _, s := range m.secondaries {
+		if err := s.SetReadBuffer(bytes); err != nil {
+			return err
+		}
+	}
+	return nil
 }

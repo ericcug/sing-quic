@@ -46,6 +46,12 @@ const maxUDPDatagramBuffer = 65535
 // and lifetime timers.
 const udpRelayWriteTimeout = 10 * time.Second
 
+// udpCloseWriteTimeout bounds the CLOSE frame a client sends to dissolve a
+// UDP association. Close is the caller's own teardown; it must not wait on a
+// peer that stopped reading, and the association ends with the framing
+// teardown that follows either way.
+const udpCloseWriteTimeout = 5 * time.Second
+
 type udpCounters struct {
 	up   atomic.Uint64
 	down atomic.Uint64
@@ -105,15 +111,21 @@ func (w *packetWindow) admit(seq uint64) bool {
 // ListenPacket creates a UDP association and returns it as a native
 // net.PacketConn.
 func (c *Client) ListenPacket(ctx context.Context, onClose func(error)) (net.PacketConn, error) {
+	slot, ok := c.sessionLimit.acquire()
+	if !ok {
+		return nil, errors.New("local session limit reached")
+	}
 	if !c.admitPendingOpen() {
+		slot.release()
 		return nil, errors.New("local pending-open limit reached")
 	}
 	assoc, err := c.openUDPAssociation(ctx)
 	c.releasePendingOpen()
 	if err != nil {
+		slot.release()
 		return nil, err
 	}
-	return newClientUDPPacketConn(c, assoc, onClose), nil
+	return newClientUDPPacketConn(c, assoc, slot, onClose), nil
 }
 
 // readWaitQueue bounds how many inbound packets wait for the application.
@@ -122,6 +134,7 @@ const readWaitQueue = 64
 type clientUDPPacketConn struct {
 	client       *Client
 	association  *udpAssociation
+	slot         sessionSlot
 	frames       <-chan protocol.Frame
 	frameErr     <-chan error
 	cancel       context.CancelFunc
@@ -139,12 +152,13 @@ type readResult struct {
 	err         error
 }
 
-func newClientUDPPacketConn(c *Client, assoc *udpAssociation, onClose func(error)) *clientUDPPacketConn {
-	ctx, cancel := context.WithCancel(context.Background())
+func newClientUDPPacketConn(c *Client, assoc *udpAssociation, slot sessionSlot, onClose func(error)) *clientUDPPacketConn {
+	ctx, cancel := context.WithCancel(c.ctx)
 	frames, frameErr := udpFrames(ctx, assoc.lane.fc, assoc.flowID)
 	conn := &clientUDPPacketConn{
 		client:       c,
 		association:  assoc,
+		slot:         slot,
 		frames:       frames,
 		frameErr:     frameErr,
 		ctx:          ctx,
@@ -161,6 +175,7 @@ func newClientUDPPacketConn(c *Client, assoc *udpAssociation, onClose func(error
 // read cadence, and only resolves a destination the server named by name
 // when the peer itself answers with one.
 func (c *clientUDPPacketConn) readLoop() {
+	defer c.slot.release()
 	// udpFrames claimed this flow's share of the lane connection's coded
 	// datagrams; this loop is the subscription's last consumer, so it is the
 	// one that returns it. Without this, every UDP association leaves its
@@ -173,6 +188,14 @@ func (c *clientUDPPacketConn) readLoop() {
 		case <-c.ctx.Done():
 			return
 		case err := <-c.frameErr:
+			// The lane's framing ended. Cancelling here rather than waiting
+			// for the application's own Close is what makes the next ReadFrom
+			// return instead of parking on a readChan that has one buffered
+			// error in it, and closing the framing is what returns the pooled
+			// control stream to the connection it came from -- a raw caller
+			// that stops reading without closing would otherwise hold both.
+			c.cancel()
+			_ = c.association.lane.fc.Close()
 			c.notifyClose(err)
 			select {
 			case c.readChan <- readResult{err: err}:
@@ -181,7 +204,39 @@ func (c *clientUDPPacketConn) readLoop() {
 			return
 		case frame, ok := <-c.frames:
 			if !ok {
+				c.cancel()
+				_ = c.association.lane.fc.Close()
 				c.notifyClose(net.ErrClosed)
+				select {
+				case c.readChan <- readResult{err: net.ErrClosed}:
+				case <-c.ctx.Done():
+				}
+				return
+			}
+			if frame.Header.Type == protocol.TypeReset {
+				// A reset is terminal and carries its reason; it is not a
+				// packet to skip. Ending here is what lets the application
+				// see the server dissolving the association, which waiting
+				// for an error that will never come did not.
+				c.cancel()
+				_ = c.association.lane.fc.Close()
+				err := errors.New("peer reset UDP association")
+				if len(frame.Payload) > 1 {
+					err = fmt.Errorf("peer reset UDP association: %s", string(frame.Payload[1:]))
+				}
+				c.notifyClose(err)
+				select {
+				case c.readChan <- readResult{err: err}:
+				case <-c.ctx.Done():
+				}
+				return
+			}
+			if frame.Header.Type == protocol.TypeAck && frame.Header.Flags == protocol.FlagAckFinal {
+				// The peer's terminal acknowledgement: the association is
+				// over from its side, and the clean end to report is EOF.
+				c.cancel()
+				_ = c.association.lane.fc.Close()
+				c.notifyClose(nil)
 				select {
 				case c.readChan <- readResult{err: net.ErrClosed}:
 				case <-c.ctx.Done():
@@ -274,7 +329,15 @@ func (c *clientUDPPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error
 func (c *clientUDPPacketConn) Close() error {
 	c.notifyClose(nil)
 	c.cancel()
-	_ = c.association.lane.fc.Write(protocol.Frame{
+	// The close frame is bounded by its own deadline rather than left to an
+	// unbounded stream write: a lane whose peer stopped reading would hold
+	// this Close -- and with it the caller's own teardown -- until the
+	// connection's idle timeout. WriteContext bounds the wait for the stream
+	// lock and the write itself; a frame that does not get out in time is
+	// closed-over by the framing teardown that follows, which the peer still
+	// reading learns of the same way.
+	writeCtx, cancelWrite := context.WithTimeout(context.Background(), udpCloseWriteTimeout)
+	_ = c.association.lane.fc.WriteContext(writeCtx, protocol.Frame{
 		Header: protocol.Header{
 			Version:   protocol.Version,
 			Type:      protocol.TypeClose,
@@ -283,6 +346,7 @@ func (c *clientUDPPacketConn) Close() error {
 			FlowID:    c.association.flowID,
 		},
 	})
+	cancelWrite()
 	return c.association.lane.fc.Close()
 }
 

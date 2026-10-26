@@ -97,9 +97,9 @@ func (a *AdaptiveSender) HasPacingBudget(now monotime.Time) bool {
 	return a.pacer.budget(now) >= a.maxDatagramSize
 }
 
-func (a *AdaptiveSender) OnPacketSent(sentTime monotime.Time, bytesInFlight quiccongestion.ByteCount, _ quiccongestion.PacketNumber, bytes quiccongestion.ByteCount, _ bool) {
+func (a *AdaptiveSender) OnPacketSent(sentTime monotime.Time, bytesInFlight quiccongestion.ByteCount, _ quiccongestion.PacketNumber, bytes quiccongestion.ByteCount, retransmittable bool) {
 	a.pacer.sentPacket(sentTime, bytes)
-	a.bytesInFlight = bytesInFlight
+	a.bytesInFlight = postSendBytesInFlight(bytesInFlight, bytes, retransmittable)
 	a.publishTelemetry()
 }
 
@@ -128,8 +128,11 @@ func (a *AdaptiveSender) OnCongestionEvent(_ quiccongestion.PacketNumber, _ quic
 }
 
 func (a *AdaptiveSender) OnCongestionEventEx(priorInFlight quiccongestion.ByteCount, eventTime monotime.Time, acked []quiccongestion.AckedPacketInfo, lost []quiccongestion.LostPacketInfo) {
-	a.bytesInFlight = priorInFlight
+	var ackedBytes uint64
 	for _, p := range acked {
+		if p.BytesAcked > 0 {
+			ackedBytes = satAddUint64(ackedBytes, uint64(p.BytesAcked))
+		}
 		a.windowAcked += p.BytesAcked
 	}
 	var lostBytes uint64
@@ -139,6 +142,7 @@ func (a *AdaptiveSender) OnCongestionEventEx(priorInFlight quiccongestion.ByteCo
 		}
 		a.windowLost += p.BytesLost
 	}
+	a.bytesInFlight = saturatingRemaining(priorInFlight, ackedBytes, lostBytes)
 	if lostBytes > 0 {
 		a.telemetry.observeLoss(lostBytes, uint64(len(lost)))
 	}

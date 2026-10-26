@@ -453,3 +453,13 @@ func (c *frameConn) Close() error {
 	c.closeOnce.Do(func() { close(c.done) })
 	return c.control.Close()
 }
+
+// doneChan is closed when this lane's framing closes. A nil channel never
+// selects, so a test lane without a framing connection parks on the flow's
+// own closure the way it always did.
+func (c *frameConn) doneChan() <-chan struct{} {
+	if c == nil {
+		return nil
+	}
+	return c.done
+}

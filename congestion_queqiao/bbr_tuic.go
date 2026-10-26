@@ -379,7 +379,9 @@ func (b *TUICBBRSender) HasPacingBudget(now monotime.Time) bool {
 }
 
 func (b *TUICBBRSender) OnPacketSent(sentTime monotime.Time, bytesInFlight quiccongestion.ByteCount, number quiccongestion.PacketNumber, bytes quiccongestion.ByteCount, retransmittable bool) {
-	b.maxSentPN = number
+	if retransmittable {
+		b.maxSentPN = number
+	}
 	// sing-box's quic-go fork reports the flight from before the reported
 	// packet was sent -- priorInFlight in its sent packet handler, matching
 	// quiche's SendAlgorithmInterface, as its own congestion interface
@@ -518,9 +520,8 @@ func (b *TUICBBRSender) OnCongestionEventEx(priorInFlight quiccongestion.ByteCou
 
 	bytesAckedWindow := b.estimator.bytesAckedThisWindow()
 	b.ackedBytes = satAddUint64(b.ackedBytes, bytesAckedWindow)
-	excessAcked := uint64(0)
 	if bytesAckedWindow > 0 {
-		excessAcked = b.ackAgg.update(bytesAckedWindow, eventTime, b.round, b.estimator.estimate())
+		_ = b.ackAgg.update(bytesAckedWindow, eventTime, b.round, b.estimator.estimate())
 	}
 	b.estimator.endAcks()
 	// What this connection has been measured to deliver outlives the filter's
@@ -549,7 +550,7 @@ func (b *TUICBBRSender) OnCongestionEventEx(priorInFlight quiccongestion.ByteCou
 	b.maybeExitStartupDrain(eventTime, b.bytesInFlight)
 	b.maybeProbeRTT(eventTime, isRoundStart, b.bytesInFlight, minRTTExpired)
 	b.calculatePacingRate()
-	b.calculateCwnd(bytesAckedWindow, excessAcked)
+	b.calculateCwnd(bytesAckedWindow)
 	// Native TUIC calculates recovery from the post-event in-flight remainder.
 	// Adding bytesAcked in calculateRecoveryWindow then permits the newly
 	// acknowledged amount while accounting for losses in the same event.
@@ -860,7 +861,7 @@ func (b *TUICBBRSender) calculatePacingRate() {
 	}
 }
 
-func (b *TUICBBRSender) calculateCwnd(bytesAcked, excessAcked uint64) {
+func (b *TUICBBRSender) calculateCwnd(bytesAcked uint64) {
 	if b.mode == tuicBbrProbeRTT {
 		return
 	}

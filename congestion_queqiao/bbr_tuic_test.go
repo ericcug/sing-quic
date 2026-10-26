@@ -605,7 +605,7 @@ func TestTUICProbeRTTPreservesModelAndExitsAfterPriorRound(t *testing.T) {
 	if sender.mode != tuicBbrProbeRTT || sender.GetCongestionWindow() != sender.minCwnd || !sender.estimator.appLimited {
 		t.Fatalf("ProbeRTT entry mismatch: mode=%v window=%d app_limited=%v", sender.mode, sender.GetCongestionWindow(), sender.estimator.appLimited)
 	}
-	sender.calculateCwnd(64*1024, 0)
+	sender.calculateCwnd(64 * 1024)
 	if sender.cwnd != 512*1024 {
 		t.Fatalf("ProbeRTT destroyed saved congestion window: %d", sender.cwnd)
 	}

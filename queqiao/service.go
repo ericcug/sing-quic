@@ -9,6 +9,7 @@ import (
 
 	"github.com/sagernet/sing-quic/queqiao/internal/pep"
 	"github.com/sagernet/sing/common/auth"
+	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
@@ -50,8 +51,12 @@ func NewService(options ServiceOptions) (*Service, error) {
 	if options.Logger == nil {
 		options.Logger = logger.NOP()
 	}
-	if len(options.TLSConfig.NextProtos) == 0 {
-		options.TLSConfig.NextProtos = []string{pep.ALPN}
+	if options.TLSConfig == nil {
+		return nil, E.New("queqiao: TLS configuration is required")
+	}
+	tlsConfig := options.TLSConfig.Clone()
+	if len(tlsConfig.NextProtos) == 0 {
+		tlsConfig.NextProtos = []string{pep.ALPN}
 	}
 	serviceCtx, cancel := context.WithCancel(options.Context)
 	service := &Service{
@@ -61,7 +66,7 @@ func NewService(options ServiceOptions) (*Service, error) {
 		handler: options.Handler,
 	}
 	core, err := pep.NewServer(pep.ServerConfig{
-		TLSConfig:         options.TLSConfig,
+		TLSConfig:         tlsConfig,
 		Authenticator:     options.Authenticator,
 		Passwords:         options.Users,
 		HopPortCount:      options.HopPortCount,
@@ -69,6 +74,7 @@ func NewService(options ServiceOptions) (*Service, error) {
 		Logger:            slog.New(&slogHandler{logger: options.Logger}),
 	})
 	if err != nil {
+		cancel()
 		return nil, err
 	}
 	service.core = core

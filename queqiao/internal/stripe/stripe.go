@@ -270,6 +270,7 @@ type Scheduler struct {
 	laneBytes   map[uint64]uint64
 	laneQueued  map[uint64]uint64
 	totalBytes  uint64
+	liveBytes   uint64
 	nextAttempt uint64
 	eof         bool
 	srcErr      error
@@ -383,10 +384,17 @@ func (s *Scheduler) readAheadLimit() int {
 
 // retainedBytes is what the flow is holding: chunks read but not yet
 // acknowledged. Must be called with the lock held.
+//
+// Each distinct chunk is counted once regardless of how many attempts are in
+// flight for it or whether it has also been re-offered in pending: the
+// attempts share one backing slice, and totalBytes counts wire commitments
+// rather than memory.
 func (s *Scheduler) retainedBytes() uint64 {
-	total := s.totalBytes
+	total := s.liveBytes
 	for _, chunk := range s.pending {
-		total += uint64(len(chunk.Data))
+		if _, inLive := s.live[chunk.Offset]; !inLive {
+			total += uint64(len(chunk.Data))
+		}
 	}
 	return total
 }
@@ -396,18 +404,20 @@ func (s *Scheduler) retainedBytes() uint64 {
 // bytes that precede it.
 func (s *Scheduler) markEOFLocked() {
 	s.eof = true
-	if len(s.pending) > 0 {
-		s.pending[len(s.pending)-1].Final = true
+	// Only a pending chunk that actually ends the stream -- its end is the
+	// producer's cursor -- can carry Final in place. When the last data chunk
+	// is already in flight and the only thing in pending is a requeued middle
+	// chunk, marking that one would name the wrong byte as the end of the
+	// stream; the tail gets an empty final chunk instead.
+	if n := len(s.pending); n > 0 && s.pending[n-1].End() == s.nextOffset {
+		s.pending[n-1].Final = true
 		return
 	}
-	for _, out := range s.live {
-		if out.chunk.End() == s.nextOffset {
-			// The last data chunk is already in flight; it cannot be amended,
-			// so the stream is ended by an empty final chunk at the tail.
-			break
-		}
-	}
 	s.pending = append(s.pending, &Chunk{Offset: s.nextOffset, Final: true})
+}
+
+func (s *Scheduler) hasUrgentLocked() bool {
+	return len(s.pending) > 0 && s.pending[0].urgent
 }
 
 // Next blocks until this lane should carry a chunk, and returns it. It returns
@@ -431,7 +441,7 @@ func (s *Scheduler) Next(ctx context.Context, laneID uint64, windowBytes int) (*
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		if s.laneLoad[laneID] < s.cfg.LaneWindow {
+		if s.laneLoad[laneID] < s.cfg.LaneWindow || s.hasUrgentLocked() {
 			if chunk := s.takeReadyLocked(laneID, windowBytes); chunk != nil {
 				return chunk, nil
 			}
@@ -476,6 +486,7 @@ func (s *Scheduler) takeReadyLocked(laneID uint64, windowBytes int) *Chunk {
 		if !exists {
 			out = &outstanding{chunk: chunk}
 			s.live[chunk.Offset] = out
+			s.liveBytes += uint64(len(chunk.Data))
 			s.stats.ChunksIssued++
 			s.stats.BytesIssued += uint64(len(chunk.Data))
 		} else {
@@ -568,6 +579,11 @@ func (s *Scheduler) Complete(laneID uint64, chunk *Chunk) {
 	if ok {
 		for _, a := range live.attempts {
 			s.releaseLaneLocked(a.lane, uint64(len(live.chunk.Data)), !a.written)
+		}
+		if size := uint64(len(live.chunk.Data)); s.liveBytes >= size {
+			s.liveBytes -= size
+		} else {
+			s.liveBytes = 0
 		}
 		delete(s.live, chunk.Offset)
 		s.stats.ChunksCompleted++
@@ -753,16 +769,13 @@ func (s *Scheduler) retransmitAfter() time.Duration {
 // requeueLocked returns a chunk to the ready set in offset order, so the
 // receiver's contiguous point is always what the next free lane works on.
 func (s *Scheduler) requeueLocked(chunk *Chunk) {
-	if s.pendingHas(chunk.Offset) {
+	i := sort.Search(len(s.pending), func(k int) bool { return s.pending[k].Offset >= chunk.Offset })
+	if i < len(s.pending) && s.pending[i].Offset == chunk.Offset {
 		return
 	}
 	// A chunk only returns to the ready set because a lane stalled or failed,
 	// which makes it the work most likely to be blocking delivery.
 	chunk.urgent = true
-	i := 0
-	for i < len(s.pending) && s.pending[i].Offset < chunk.Offset {
-		i++
-	}
 	s.pending = append(s.pending, nil)
 	copy(s.pending[i+1:], s.pending[i:])
 	s.pending[i] = chunk
@@ -935,14 +948,13 @@ func (s *Scheduler) retireUnreliableAttemptsLocked(out *outstanding, deadline ti
 // removePendingLocked drops a chunk from the ready set, for a chunk that has
 // arrived by another route.
 func (s *Scheduler) removePendingLocked(offset uint64) *Chunk {
-	for i, chunk := range s.pending {
-		if chunk.Offset != offset {
-			continue
-		}
-		s.pending = append(s.pending[:i], s.pending[i+1:]...)
-		return chunk
+	i := sort.Search(len(s.pending), func(k int) bool { return s.pending[k].Offset >= offset })
+	if i >= len(s.pending) || s.pending[i].Offset != offset {
+		return nil
 	}
-	return nil
+	chunk := s.pending[i]
+	s.pending = append(s.pending[:i], s.pending[i+1:]...)
+	return chunk
 }
 
 func (s *Scheduler) releaseChunkLocked(chunk *Chunk) {
@@ -955,12 +967,8 @@ func (s *Scheduler) releaseChunkLocked(chunk *Chunk) {
 }
 
 func (s *Scheduler) pendingHas(offset uint64) bool {
-	for _, c := range s.pending {
-		if c.Offset == offset {
-			return true
-		}
-	}
-	return false
+	i := sort.Search(len(s.pending), func(k int) bool { return s.pending[k].Offset >= offset })
+	return i < len(s.pending) && s.pending[i].Offset == offset
 }
 
 // Done is closed once every byte of the source has been delivered. A caller

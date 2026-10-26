@@ -430,6 +430,13 @@ func (s *Server) handleSession(ctx context.Context, conn streamConn, user string
 	if streamConn, isQUIC := conn.(*quicStreamConn); isQUIC && streamConn.conn != nil {
 		ctx = WithPeerAddr(ctx, streamConn.conn.RemoteAddr())
 	}
+	// The session's context ends with the session rather than with the
+	// listener that accepted it: a destination dialled through the host's
+	// policy should not outlive the flow it was opened for, and the root
+	// context here is the server's, which spans every session it will ever
+	// serve.
+	ctx, cancelSession := context.WithCancel(ctx)
+	defer cancelSession()
 	defer conn.Close()
 	if auth != nil {
 		auth.flows.Add(1)
@@ -766,6 +773,7 @@ func (s *Server) handleLaneJoinOpen(ctx context.Context, conn streamConn, fc *fr
 		}})
 	}
 	select {
+	case <-fc.doneChan():
 	case <-serverSession.flow.doneChan():
 	case <-ctx.Done():
 	}

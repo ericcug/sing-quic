@@ -648,6 +648,7 @@ func (f *multipathFlow) writeLane(lane *mpLane) {
 // select, then check both queues while waiting. The non-blocking first check
 // closes the common race where both queues already have work.
 func nextLaneFrame(lane *mpLane, done <-chan struct{}, ctxDone <-chan struct{}) (laneFrame, bool) {
+	laneDone := lane.fc.doneChan()
 	if lane.writeInteractiveQ != nil {
 		select {
 		case frame := <-lane.writeInteractiveQ:
@@ -657,6 +658,8 @@ func nextLaneFrame(lane *mpLane, done <-chan struct{}, ctxDone <-chan struct{}) 
 	}
 	for {
 		select {
+		case <-laneDone:
+			return laneFrame{}, false
 		case <-done:
 			return laneFrame{}, false
 		case <-ctxDone:
@@ -675,6 +678,8 @@ func nextLaneFrame(lane *mpLane, done <-chan struct{}, ctxDone <-chan struct{}) 
 			return frame, true
 		case frame := <-lane.writeQ:
 			return frame, true
+		case <-laneDone:
+			return laneFrame{}, false
 		case <-done:
 			return laneFrame{}, false
 		case <-ctxDone:
@@ -936,6 +941,9 @@ func (f *multipathFlow) retireOldestLane(control bool, minAge time.Duration) boo
 	if victim.fc != nil {
 		_ = victim.fc.Close()
 	}
+	if sched := f.scheduler.Load(); sched != nil {
+		sched.RetireLane(victim.id)
+	}
 	return true
 }
 
@@ -1012,6 +1020,9 @@ func (f *multipathFlow) retireLeastProductiveLane() bool {
 	if victim.fc != nil {
 		_ = victim.fc.Close()
 	}
+	if sched := f.scheduler.Load(); sched != nil {
+		sched.RetireLane(victim.id)
+	}
 	return true
 }
 
@@ -1070,6 +1081,7 @@ func (f *multipathFlow) readLaneBulk(lane *mpLane) {
 		return
 	}
 	defer lane.fc.releaseBulk(f.flowID)
+	laneDone := lane.fc.doneChan()
 	for {
 		select {
 		case frame, ok := <-frames:
@@ -1079,6 +1091,12 @@ func (f *multipathFlow) readLaneBulk(lane *mpLane) {
 			if !f.deliverInbound(lane, frame) {
 				return
 			}
+		case <-laneDone:
+			// A retired or failed lane has no business reading the flow's
+			// shared datagram channel: another lane on the same connection is
+			// the one that stays, and holding the subscription here keeps its
+			// reference count from reaching zero until the whole flow ends.
+			return
 		case <-f.done:
 			// The flow's own closure, not the context it was started with:
 			// that context belongs to the whole client and outlives every flow

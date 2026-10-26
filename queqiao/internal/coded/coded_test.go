@@ -849,3 +849,27 @@ func TestAShrunkCarrierDoesNotKillRepairsForAWindow(t *testing.T) {
 			repairsBefore, repairs, refusedAfter-refusedBefore)
 	}
 }
+
+// A peer that only ever sends backward -- identifiers already behind the
+// assembly window -- must not grow the group table. Those symbols can never
+// complete a frame, and accepting them is what let a stream of stale
+// identifiers open a group apiece with nothing to prune them.
+func TestStaleFragmentsBehindTheWindowAreRefused(t *testing.T) {
+	var a assembler
+	var out [][]byte
+	symbol := make([]byte, symbolHeader+4)
+	binary.BigEndian.PutUint16(symbol[0:], 4)
+	binary.BigEndian.PutUint16(symbol[4:], 2) // 2-part frame
+	// Establish the window's high water mark well ahead.
+	out = a.arrived(10000, symbol, out)
+	// Walk backward far behind the window.
+	for esi := uint32(100); esi < 9000; esi += 10 {
+		out = a.arrived(esi, symbol, out)
+	}
+	if len(a.groups) > assemblerMaxGroups {
+		t.Fatalf("%d groups retained, want at most %d", len(a.groups), assemblerMaxGroups)
+	}
+	if a.droppedStale == 0 {
+		t.Fatal("stale fragments were not refused at the window boundary")
+	}
+}

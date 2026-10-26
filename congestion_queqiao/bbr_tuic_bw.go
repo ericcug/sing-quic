@@ -128,10 +128,10 @@ func (e *tuicBandwidthEstimator) markAppLimited() {
 // controlled packet is sent. Non-retransmittable packets are intentionally
 // excluded from delivery-rate samples, matching QUIC BBR practice.
 func (e *tuicBandwidthEstimator) onSentPacket(now monotime.Time, number quiccongestion.PacketNumber, bytes, bytesInFlight uint64, retransmittable bool) {
-	e.lastSentPacket = number
 	if !retransmittable || bytes == 0 {
 		return
 	}
+	e.lastSentPacket = number
 	e.totalSent = satAddUint64(e.totalSent, bytes)
 	// TUIC's sampler establishes an A0/S0 point whenever a new flight starts.
 	// Without this point the entire first congestion window produces no

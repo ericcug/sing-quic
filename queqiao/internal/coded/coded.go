@@ -361,9 +361,6 @@ func (p *Path) sendFragments(frame []byte, limit int) error {
 	return nil
 }
 
-// maxFragments is what the fragment count field can say.
-const maxFragments = 0xFFFF
-
 // maxSymbolParts is the widest fragment span a receiver will hold, and the
 // widest a sender will emit. The count field can name 65535 parts; no frame
 // this protocol carries needs a fraction of that, because the largest
@@ -672,6 +669,11 @@ type assembler struct {
 	high   uint32
 	seen   bool
 	lostN  uint64
+	// droppedStale counts symbols refused for arriving behind the assembly
+	// window: a peer that only ever sends backward either disagrees about the
+	// wire or is spending memory on this end, and the counter is how a trace
+	// says which.
+	droppedStale uint64
 }
 
 type fragmentGroup struct {
@@ -708,10 +710,26 @@ func (a *assembler) arrived(esi uint32, vector []byte, out [][]byte) [][]byte {
 		return parseFrames(payload, out)
 	}
 	first := esi - uint32(index)
+	// A group whose whole span is behind the assembly window cannot complete:
+	// its symbols were either already delivered or already declared lost, and
+	// nothing can reach back for them. Accepting it is what let a peer that
+	// only ever sends backward grow the table without bound -- every symbol a
+	// new group, never advanced past, never pruned.
+	if a.seen && int32(a.high-(first+uint32(count))) > assemblerSlack {
+		a.droppedStale++
+		return out
+	}
 	group := a.groups[first]
 	if group == nil {
 		if a.groups == nil {
 			a.groups = map[uint32]*fragmentGroup{}
+		}
+		// The count of groups is bounded the same way their width is: a peer
+		// controls the identifiers that open them, and an unbounded table is
+		// memory the wire never paid for. The oldest group is dropped, which
+		// is the one the window is closest to retiring anyway.
+		if len(a.groups) >= assemblerMaxGroups {
+			a.dropOldestGroupLocked()
 		}
 		group = &fragmentGroup{count: count}
 		a.groups[first] = group
@@ -762,11 +780,34 @@ func (a *assembler) lost(esi uint32) {
 // symbols would throw away a repair that had already arrived and been solved.
 const assemblerSlack = fec.MinDecoderWidth
 
+// assemblerMaxGroups bounds how many partly-arrived frames the assembler
+// holds, independent of where they sit. The window already retires what falls
+// behind; this is the belt to that suspenders, for a peer whose arithmetic
+// lands in the wrap-around of the 32-bit comparisons or for a regression in
+// the window itself. At the widest legal span it holds a full window's worth
+// of single-fragment groups with room to spare.
+const assemblerMaxGroups = 2 * fec.MaxRepairWindow
+
 func (a *assembler) prune() {
 	for first, group := range a.groups {
 		if int32(a.high-(first+uint32(group.count))) > assemblerSlack {
 			delete(a.groups, first)
 		}
+	}
+}
+
+func (a *assembler) dropOldestGroupLocked() {
+	var oldest uint32
+	var oldestDist int32
+	set := false
+	for first := range a.groups {
+		dist := int32(a.high - first)
+		if !set || dist > oldestDist {
+			oldest, oldestDist, set = first, dist, true
+		}
+	}
+	if set {
+		delete(a.groups, oldest)
 	}
 }
 

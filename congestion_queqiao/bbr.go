@@ -2,6 +2,7 @@ package congestion_queqiao
 
 import (
 	"math"
+	"sort"
 	"time"
 
 	quiccongestion "github.com/sagernet/quic-go/congestion"
@@ -70,13 +71,11 @@ type BBRSender struct {
 	cycleStart  monotime.Time
 	cycleOffset uint8
 
-	inRecovery      bool
-	recoveryWindow  quiccongestion.ByteCount
-	endRecoveryPN   quiccongestion.PacketNumber
-	recoveryLosses  quiccongestion.ByteCount
-	probeRTTExit    monotime.Time
-	probeRTTStarted bool
-	telemetry       telemetryState
+	inRecovery     bool
+	recoveryWindow quiccongestion.ByteCount
+	endRecoveryPN  quiccongestion.PacketNumber
+	probeRTTExit   monotime.Time
+	telemetry      telemetryState
 }
 
 type bbrMode uint8
@@ -180,22 +179,30 @@ func (b *BBRSender) rtt() time.Duration {
 	return 200 * time.Millisecond
 }
 
-func (b *BBRSender) refreshRTT(now monotime.Time) {
+func (b *BBRSender) refreshRTT(now monotime.Time) bool {
 	measured := time.Duration(0)
 	if b.rttStats != nil {
-		measured = b.rttStats.MinRTT()
+		// LatestRTT first, not MinRTT: the provider's minimum never expires,
+		// so reading it here would defeat ProbeRTT's whole purpose -- expiring
+		// a stale floor when the path moved to a longer route.
+		measured = b.rttStats.LatestRTT()
+		if measured <= 0 {
+			measured = b.rttStats.MinRTT()
+		}
 		if measured <= 0 {
 			measured = b.rttStats.SmoothedRTT()
 		}
-		if measured <= 0 {
-			measured = b.rttStats.LatestRTT()
-		}
 	}
-	if measured > 0 && (b.minRTT <= 0 || measured < b.minRTT) {
+	if measured <= 0 {
+		return false
+	}
+	expired := !b.minRTTAt.IsZero() && now.Sub(b.minRTTAt) >= bbrProbeRTTInterval
+	if b.minRTT <= 0 || measured < b.minRTT || expired {
 		b.minRTT = measured
 		b.minRTTAt = now
 		b.updateWindow(0)
 	}
+	return expired
 }
 
 func (b *BBRSender) bandwidth() quiccongestion.ByteCount {
@@ -236,19 +243,19 @@ func (b *BBRSender) HasPacingBudget(now monotime.Time) bool {
 }
 
 func (b *BBRSender) OnPacketSent(sentTime monotime.Time, bytesInFlight quiccongestion.ByteCount, number quiccongestion.PacketNumber, bytes quiccongestion.ByteCount, retransmittable bool) {
-	b.lastSent = number
 	// bytesInFlight is the value before this packet is accounted for.
 	//
 	// A packet the connection does not count as in flight -- a pure ACK --
 	// never appears in an acknowledgement or a loss report, so it has no
-	// state worth recording and no bytes worth counting; recording it anyway
-	// is what filled the table with entries only the quadratic prune could
-	// remove.
+	// state worth recording, no bytes worth counting, and no business
+	// advancing lastSent: a round or recovery boundary set to its number
+	// could not be acknowledged itself.
 	if !retransmittable {
 		b.bytesInFlight = maxByteCount(0, bytesInFlight)
 		b.publishTelemetry()
 		return
 	}
+	b.lastSent = number
 	if bytes < 0 || bytesInFlight < 0 || bytes > maxCongestionByteCount-bytesInFlight {
 		b.bytesInFlight = maxCongestionByteCount
 	} else {
@@ -293,20 +300,23 @@ func (b *BBRSender) pruneSendStates() {
 	if len(b.sendStates) < bbrMaxSendStates {
 		return
 	}
-	remove := bbrMaxSendStates / 4
-	for i := 0; i < remove; i++ {
-		var oldestPN quiccongestion.PacketNumber
-		var oldest monotime.Time
-		first := true
-		for pn, state := range b.sendStates {
-			if first || state.sentTime.Before(oldest) {
-				oldestPN, oldest, first = pn, state.sentTime, false
-			}
-		}
-		if first {
-			return
-		}
-		delete(b.sendStates, oldestPN)
+	// Packet numbers only increase, so the oldest entries are the lowest
+	// numbers. Sorting the keys once replaces the 2048 full-table scans that
+	// used to run on the connection's packet goroutine whenever the cap was
+	// reached, and removes enough to bring the table below the cap even when
+	// a caller somehow exceeded it by more than a quarter.
+	numbers := make([]quiccongestion.PacketNumber, 0, len(b.sendStates))
+	for pn := range b.sendStates {
+		numbers = append(numbers, pn)
+	}
+	sort.Slice(numbers, func(i, j int) bool { return numbers[i] < numbers[j] })
+	target := bbrMaxSendStates - bbrMaxSendStates/4
+	remove := len(numbers) - target
+	if remove > len(numbers) {
+		remove = len(numbers)
+	}
+	for _, pn := range numbers[:remove] {
+		delete(b.sendStates, pn)
 	}
 }
 
@@ -333,7 +343,6 @@ func (b *BBRSender) OnCongestionEventEx(priorInFlight quiccongestion.ByteCount, 
 	if eventTime.IsZero() {
 		eventTime = monotime.Now()
 	}
-	b.bytesInFlight = priorInFlight
 	var ackedBytes quiccongestion.ByteCount
 	var largestAck quiccongestion.PacketNumber
 	for _, p := range acked {
@@ -346,17 +355,27 @@ func (b *BBRSender) OnCongestionEventEx(priorInFlight quiccongestion.ByteCount, 
 			largestAck = p.PacketNumber
 		}
 	}
-	if len(acked) > 0 {
-		b.lastAcked = largestAck
-		b.refreshRTT(eventTime)
-		b.updateBandwidthFromPackets(eventTime, acked, uint64(ackedBytes))
-		b.updateRound(largestAck)
-	}
 	var lostBytes uint64
 	for _, p := range lost {
 		if p.BytesLost > 0 {
 			lostBytes = satAddUint64(lostBytes, uint64(p.BytesLost))
 		}
+	}
+	// Post-event flight: priorInFlight is taken before the connection removed
+	// these acknowledgements and losses, so subtracting them gives the flight
+	// that remains when noteLoss and transition inspect it.
+	b.bytesInFlight = saturatingRemaining(priorInFlight, uint64(ackedBytes), lostBytes)
+	var minRTTExpired bool
+	if len(acked) > 0 {
+		b.lastAcked = largestAck
+		minRTTExpired = b.refreshRTT(eventTime)
+		// Advance the round before recording samples, so a sample that
+		// crosses the boundary is stamped with the round it opens rather than
+		// the one it just closed.
+		b.updateRound(largestAck)
+		b.updateBandwidthFromPackets(eventTime, acked, uint64(ackedBytes))
+	}
+	for _, p := range lost {
 		// BBR does not leave STARTUP on an isolated loss. Doing so was a major
 		// source of the old controller's collapse on this path: one reordered
 		// packet permanently converted a healthy startup into a tiny recovery
@@ -369,20 +388,14 @@ func (b *BBRSender) OnCongestionEventEx(priorInFlight quiccongestion.ByteCount, 
 	if lostBytes > 0 {
 		b.telemetry.observeLoss(lostBytes, uint64(len(lost)))
 	}
-	b.transition(eventTime, priorInFlight, len(lost) > 0)
+	b.transition(eventTime, b.bytesInFlight, len(lost) > 0, minRTTExpired)
 	b.updateWindow(ackedBytes)
-	b.bytesInFlight = priorInFlight
 	b.deliveredBytes += uint64(ackedBytes)
 	for _, p := range acked {
 		delete(b.sendStates, p.PacketNumber)
 	}
 	for _, p := range lost {
 		delete(b.sendStates, p.PacketNumber)
-	}
-	if ackedBytes >= b.recoveryLosses {
-		b.recoveryLosses = 0
-	} else {
-		b.recoveryLosses -= ackedBytes
 	}
 	b.publishTelemetry()
 }
@@ -402,11 +415,6 @@ func (b *BBRSender) noteLoss(number quiccongestion.PacketNumber, lostBytes quicc
 		b.recoveryWindow -= lostBytes
 	} else {
 		b.recoveryWindow = b.minCwnd
-	}
-	if lostBytes < 0 || b.recoveryLosses > maxCongestionByteCount-lostBytes {
-		b.recoveryLosses = maxCongestionByteCount
-	} else {
-		b.recoveryLosses += lostBytes
 	}
 	if b.mode == bbrStartup {
 		b.fullBandwidth = true
@@ -525,7 +533,7 @@ func (b *BBRSender) updateRound(largestAck quiccongestion.PacketNumber) {
 	}
 }
 
-func (b *BBRSender) transition(now monotime.Time, inFlight quiccongestion.ByteCount, hadLoss bool) {
+func (b *BBRSender) transition(now monotime.Time, inFlight quiccongestion.ByteCount, hadLoss, minRTTExpired bool) {
 	if b.mode == bbrStartup && (b.fullBandwidth || b.roundsNoGain >= bbrStartupNoGainRounds) {
 		b.mode = bbrDrain
 		b.pacingGain = bbrDrainGain
@@ -554,11 +562,10 @@ func (b *BBRSender) transition(now monotime.Time, inFlight quiccongestion.ByteCo
 			b.pacingGain = bbrPacingGains[b.cycleOffset]
 		}
 	}
-	if !b.minRTTAt.IsZero() && now.Sub(b.minRTTAt) >= bbrProbeRTTInterval && b.mode != bbrProbeRTT {
+	if (minRTTExpired || (!b.minRTTAt.IsZero() && now.Sub(b.minRTTAt) >= bbrProbeRTTInterval)) && b.mode != bbrProbeRTT {
 		b.mode = bbrProbeRTT
 		b.pacingGain = 1
 		b.probeRTTExit = 0
-		b.probeRTTStarted = true
 	}
 	if b.mode == bbrProbeRTT {
 		if b.probeRTTExit.IsZero() && inFlight <= b.minCwnd+b.maxDatagramSize {
@@ -576,7 +583,6 @@ func (b *BBRSender) transition(now monotime.Time, inFlight quiccongestion.ByteCo
 				b.cwndGain = bbrStartupCwndGain
 			}
 			b.minRTTAt = now
-			b.probeRTTStarted = false
 		}
 	}
 	if b.inRecovery && !hadLoss && b.lastAcked > b.endRecoveryPN {

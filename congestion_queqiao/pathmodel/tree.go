@@ -409,14 +409,16 @@ func InspectTree() []NodeReport {
 	return out
 }
 
-// ForgetTree drops every node whose key begins with prefix, which is how an
-// uplink change discards what was measured about the network that is gone
-// without discarding what is known about destinations reached another way.
-func ForgetTree(prefix string) {
+// ForgetTree drops every node that names uplink, which is how an uplink
+// change discards what was measured about the network that is gone without
+// discarding what is known about destinations reached another way. Node keys
+// begin with their level ("egress|", "group|", "dest|") rather than with the
+// uplink, so the match is a containment check, not a prefix one.
+func ForgetTree(uplink string) {
 	treeMu.Lock()
 	defer treeMu.Unlock()
 	for k := range tree {
-		if prefix == "" || strings.Contains(k, prefix) {
+		if uplink == "" || strings.Contains(k, uplink) {
 			delete(tree, k)
 		}
 	}

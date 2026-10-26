@@ -57,6 +57,7 @@ func NewClient(options ClientOptions) (*Client, error) {
 		tlsConfig.NextProtos = []string{pep.ALPN}
 	}
 	core, err := pep.NewClient(pep.ClientConfig{
+		Context:        options.Context,
 		RemoteAddr:     options.RemoteAddr,
 		Dialer:         options.Dialer,
 		Password:       options.Password,
@@ -102,6 +103,17 @@ func (c *Client) ListenPacket(ctx context.Context, onClose N.CloseHandlerFunc) (
 // which is what a host reports after the network path changed.
 func (c *Client) CloseIdleConnections() {
 	c.core.CloseIdleConnections()
+}
+
+// NetworkChanged abandons the pooled connections and the measurements that
+// belong to a path that is gone, and measures the new one. It is what a host
+// reports after the device changed networks: the socket is bound to the
+// address that is gone, and the congestion and erasure measurements describe
+// the old path, so keeping them would make the first flow after the change
+// run on stale numbers. The client stays usable: the next flow dials a fresh
+// generation.
+func (c *Client) NetworkChanged() {
+	c.core.NetworkChanged()
 }
 
 func (c *Client) CloseWithError(err error) error {

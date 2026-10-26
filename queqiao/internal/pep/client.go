@@ -65,6 +65,11 @@ const (
 type ClientConfig struct {
 	RemoteAddr   string
 	LocalAddress string
+	// Context owns the client's lifetime. Cancelling it stops the background
+	// path measurement and the uplink watch, and abandons every pooled
+	// connection, without waiting for an explicit Close. The context a host
+	// passes to Start or to a flow's DialConn governs only that call.
+	Context context.Context
 	// SocketControl is invoked after an outer socket is created and before it
 	// is bound or connected. Mobile VPN clients use it to exempt Queqiao's own
 	// TCP and UDP sockets from the virtual interface. A failure aborts the dial;
@@ -147,6 +152,8 @@ type ClientConfig struct {
 
 type Client struct {
 	cfg           ClientConfig
+	ctx           context.Context
+	cancel        context.CancelFunc
 	udpHealth     *udpHealth
 	budget        *limiter.Budget
 	sessionLimit  *SessionLimit
@@ -498,8 +505,18 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 	if err := cfg.Profile.ValidateHints(); err != nil {
 		return nil, fmt.Errorf("client profile: %w", err)
 	}
+	// The lifetime context is derived here rather than taken as given so that
+	// cancelling it is always this client's own shutdown, never a caller's
+	// stray cancellation -- and so Close and a cancelled Context lead to the
+	// same place. A nil Context is the process lifetime.
+	if cfg.Context == nil {
+		cfg.Context = context.Background()
+	}
+	ctx, cancel := context.WithCancel(cfg.Context)
 	return &Client{
 		cfg:           cfg,
+		ctx:           ctx,
+		cancel:        cancel,
 		udpHealth:     newUDPHealth(cfg.UDPFailureThreshold, cfg.UDPCooldown),
 		budget:        budget,
 		metrics:       cfg.Metrics,
@@ -564,8 +581,10 @@ func (c *Client) Start(ctx context.Context) {
 
 func (c *Client) start(ctx context.Context) {
 	uplink := c.currentUplink()
-	go c.prewarmPath(ctx)
-	go c.watchUplink(ctx, uplink)
+	// The lifetime context bounds the background workers; the Start argument
+	// only says when the host's network stack became ready, and is not kept.
+	go c.prewarmPath(c.ctx)
+	go c.watchUplink(c.ctx, uplink)
 }
 
 // Close stops the client and closes its QUIC connections.
@@ -576,9 +595,23 @@ func (c *Client) Close() error {
 
 // CloseWithError abandons every pooled connection. It is safe to call more
 // than once; flows in flight on those connections fail and recover on the
-// next flow.
+// next flow. The lifetime context is cancelled as well, so the background
+// path measurement, the uplink watch, and any in-flight pooled dial all stop
+// rather than outliving the connections they were maintaining.
 func (c *Client) CloseWithError(_ error) {
+	c.cancel()
 	c.closeQUICPool()
+}
+
+// NetworkChanged abandons what belongs to a path that is gone. It is what the
+// uplink watcher concludes on its own when it notices; a host that learned
+// the same thing from its platform's notifications can say so here and get
+// the identical teardown: the reachability cooldown, the pooled connections
+// and their measurements are all evidence about the old path, and a fresh
+// measurement of the new one is started. Unlike CloseWithError this keeps the
+// client running -- the next flow dials a fresh generation.
+func (c *Client) NetworkChanged() {
+	c.onUplinkChanged(c.ctx)
 }
 
 // CloseIdleConnections retires a pooled QUIC generation that carries no flow,
@@ -628,17 +661,30 @@ func (c *Client) closeBulkQUICPool(reason string) {
 // DialConn opens one flow and returns the application side of it. onClose, when
 // given, receives the flow's terminal error exactly once.
 func (c *Client) DialConn(ctx context.Context, destination string, onClose func(error)) (net.Conn, error) {
+	slot, ok := c.sessionLimit.acquire()
+	if !ok {
+		return nil, errors.New("local session limit reached")
+	}
 	if !c.admitPendingOpen() {
+		slot.release()
 		return nil, errors.New("local pending-open limit reached")
 	}
 	flowOpenStarted := time.Now()
 	flow, err := c.openFlowWithRetries(ctx, destination)
 	c.releasePendingOpen()
 	if err != nil {
+		slot.release()
 		return nil, fmt.Errorf("remote flow open failed: %w", err)
 	}
 	c.cfg.Logger.Debug("local flow opened via DialConn", "transport", flow.kind, "duration", time.Since(flowOpenStarted))
 
+	// The caller's context governs the dial, and the dial alone. A host that
+	// cancels it -- a per-attempt timeout, a request scope closing after the
+	// connection was handed back -- must not cut a flow mid-transfer: what
+	// owns the flow's lifetime is the application's own Close on the
+	// connection below, bounded by the client's. The UDP association path
+	// derives its context here for the same reason.
+	flowCtx, flowCancel := context.WithCancel(c.ctx)
 	appConn, flowConn := newStreamPipe()
 	notified := false
 	notifyClose := func(err error) {
@@ -649,9 +695,9 @@ func (c *Client) DialConn(ctx context.Context, destination string, onClose func(
 		onClose(err)
 	}
 
-	flowSession := newMultipathFlowWithMemory(ctx, flowConn, flow.sessionID, flow.flowID, c.cfg.ChunkSize, protocol.FlagAckUp, protocol.FlagAckDown, c.budget, c.metrics, c.cfg.Logger, c.memoryLimits, c.sendMemory, c.receiveMemory, c.classifierConfig())
+	flowSession := newMultipathFlowWithMemory(flowCtx, flowConn, flow.sessionID, flow.flowID, c.cfg.ChunkSize, protocol.FlagAckUp, protocol.FlagAckDown, c.budget, c.metrics, c.cfg.Logger, c.memoryLimits, c.sendMemory, c.receiveMemory, c.classifierConfig())
 	flowSession.stallWatchdogDisabled = c.disableStallWatchdogForTest
-	c.declareClass(ctx, flowConn, flowSession)
+	c.declareClass(flowCtx, flowConn, flowSession)
 	flowSession.ackRanges.Store(true)
 	flowSession.idleTimeout = c.cfg.FlowIdleTimeout
 	flowSession.maxLifetime = c.cfg.FlowMaxLifetime
@@ -666,17 +712,21 @@ func (c *Client) DialConn(ctx context.Context, destination string, onClose func(
 		id: flow.laneID, kind: flow.kind, fc: flow.fc,
 		control: flow.reserveControl && flow.kind == TransportQUIC,
 	}); err != nil {
+		slot.release()
+		flowCancel()
 		_ = flowConn.Close()
 		_ = flow.fc.Close()
 		flowSession.closeAll()
 		return nil, err
 	}
 
-	go c.manageLanes(ctx, flowSession, flow.sessionID, flow.flowID, flow.kind)
+	go c.manageLanes(flowCtx, flowSession, flow.sessionID, flow.flowID, flow.kind)
 	go func() {
+		defer slot.release()
+		defer flowCancel()
 		c.metrics.FlowStarted()
-		stats, err := flowSession.run(ctx)
-		flowComplete := err == nil || (ctx.Err() == nil && flowSession.finSent.Load() && flowSession.remoteFinSeen.Load())
+		stats, err := flowSession.run(flowCtx)
+		flowComplete := err == nil || (flowCtx.Err() == nil && flowSession.finSent.Load() && flowSession.remoteFinSeen.Load())
 		c.metrics.FlowFinished(stats.BytesSent, stats.BytesRead, !flowComplete && err != nil && !errors.Is(err, context.Canceled))
 		if !flowComplete && err != nil && !errors.Is(err, context.Canceled) {
 			c.cfg.Logger.Debug("flow ended with error", "destination", destination, "error", err, "sent", stats.BytesSent, "read", stats.BytesRead, "duration", stats.Ended.Sub(stats.Started).Truncate(time.Millisecond))

@@ -80,14 +80,25 @@ func (p *pacer) budget(now monotime.Time) quiccongestion.ByteCount {
 	if bps <= 0 {
 		return 0
 	}
+	maxBurst := p.maxBurstSize()
 	if p.lastSentTime.IsZero() {
-		return p.maxBurstSize()
+		return maxBurst
 	}
-	budget := p.budgetAtLastSent + (bps*quiccongestion.ByteCount(now.Sub(p.lastSentTime).Nanoseconds()))/1e9
-	if budget < 0 { // protect against integer overflow
-		budget = quiccongestion.ByteCount(1<<62 - 1)
+	elapsed := now.Sub(p.lastSentTime)
+	if elapsed <= 0 {
+		return minByteCount(maxBurst, maxByteCount(0, p.budgetAtLastSent))
 	}
-	return minByteCount(p.maxBurstSize(), budget)
+	// A connection that has been quiet for a second has earned its full burst
+	// at any rate this pacer runs at; capping here keeps the product below
+	// 64-bit wraparound after a long idle without a 128-bit divide.
+	if elapsed >= time.Second {
+		return maxBurst
+	}
+	budget := p.budgetAtLastSent + (bps*quiccongestion.ByteCount(elapsed.Nanoseconds()))/1e9
+	if budget < 0 {
+		return maxBurst
+	}
+	return minByteCount(maxBurst, budget)
 }
 
 func (p *pacer) maxBurstSize() quiccongestion.ByteCount {

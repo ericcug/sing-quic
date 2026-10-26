@@ -380,31 +380,38 @@ func (b *TUICBBRSender) HasPacingBudget(now monotime.Time) bool {
 
 func (b *TUICBBRSender) OnPacketSent(sentTime monotime.Time, bytesInFlight quiccongestion.ByteCount, number quiccongestion.PacketNumber, bytes quiccongestion.ByteCount, retransmittable bool) {
 	b.maxSentPN = number
-	// apNet/quic-go calls this hook after adding an ack-eliciting packet to its
-	// connection flight. TUIC's sampler, however, takes the pre-send flight and
-	// adds the packet itself when it snapshots send state. Convert at this
-	// adapter boundary; otherwise every packet's sampler flight is one packet
-	// too large and a first packet can never be recognized as opening a flight.
-	preSendFlight := preSendBytesInFlight(bytesInFlight, bytes, retransmittable)
-	if preSendFlight == 0 {
+	// sing-box's quic-go fork reports the flight from before the reported
+	// packet was sent -- priorInFlight in its sent packet handler, matching
+	// quiche's SendAlgorithmInterface, as its own congestion interface
+	// documents. TUIC's sampler takes exactly that value and adds the packet
+	// itself when it snapshots send state, so it is passed through unchanged.
+	// Subtracting the packet here as well would double-count it: every
+	// sample's flight would be one packet too small, and a single-packet
+	// flight would be mistaken for quiescence.
+	if bytesInFlight <= 0 {
 		b.exitingQuiescence = true
 		b.restartFromIdle(sentTime)
 	}
-	// Keep the controller telemetry in the same post-send units as quic-go.
-	b.bytesInFlight = maxByteCount(0, bytesInFlight)
-	b.estimator.onSentPacket(sentTime, number, uint64(maxByteCount(0, bytes)), uint64(preSendFlight), retransmittable)
+	// Keep the controller telemetry in post-send units: the pre-send flight
+	// the fork reports, plus this packet when the connection counts it as
+	// in flight.
+	b.bytesInFlight = postSendBytesInFlight(bytesInFlight, bytes, retransmittable)
+	b.estimator.onSentPacket(sentTime, number, uint64(maxByteCount(0, bytes)), uint64(maxByteCount(0, bytesInFlight)), retransmittable)
 	b.pacer.sentPacket(sentTime, bytes)
 	b.publishTelemetry()
 }
 
-func preSendBytesInFlight(postSend, bytes quiccongestion.ByteCount, retransmittable bool) quiccongestion.ByteCount {
-	if postSend <= 0 || !retransmittable || bytes <= 0 {
-		return maxByteCount(0, postSend)
+// postSendBytesInFlight returns the connection flight after this packet was
+// sent: the pre-send flight the fork reports, plus the packet itself when it
+// is one the connection counts as in flight.
+func postSendBytesInFlight(preSend, bytes quiccongestion.ByteCount, retransmittable bool) quiccongestion.ByteCount {
+	if preSend < 0 || !retransmittable || bytes <= 0 {
+		return maxByteCount(0, preSend)
 	}
-	if postSend <= bytes {
-		return 0
+	if preSend > maxCongestionByteCount-bytes {
+		return maxCongestionByteCount
 	}
-	return postSend - bytes
+	return preSend + bytes
 }
 
 func (b *TUICBBRSender) CanSend(bytesInFlight quiccongestion.ByteCount) bool {

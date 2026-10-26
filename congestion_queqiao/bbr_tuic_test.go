@@ -9,11 +9,11 @@ import (
 )
 
 // sendTUICPacket models the pre-send flight that the sampler consumes. The
-// production QUIC adapter receives post-send bytesInFlight and converts it at
-// the controller boundary.
+// fork's QUIC adapter already receives that value -- priorInFlight, the flight
+// from before the reported packet was sent -- and hands it to the sampler
+// unchanged, so no conversion happens at the controller boundary.
 func sendTUICPacket(sender *TUICBBRSender, sentTime monotime.Time, preSend quiccongestion.ByteCount, number quiccongestion.PacketNumber, bytes quiccongestion.ByteCount) {
-	postSend := preSend + bytes
-	sender.OnPacketSent(sentTime, postSend, number, bytes, true)
+	sender.OnPacketSent(sentTime, preSend, number, bytes, true)
 }
 
 func TestTUICMinMaxRetainsPeakForTenRounds(t *testing.T) {

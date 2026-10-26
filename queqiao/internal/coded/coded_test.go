@@ -2,6 +2,7 @@ package coded
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"io"
 	"math/rand"
@@ -628,5 +629,86 @@ func TestParityCostsACodeRateAndNotAByteRate(t *testing.T) {
 	if lossyWire < budget/2 {
 		t.Fatalf("the coded path used only %d of a %d byte window, so this proves nothing "+
 			"about what it would do with a full one", lossyWire, budget)
+	}
+}
+
+// sourceDatagram builds one source-symbol datagram on the wire: a
+// transmission sequence, the kind byte, the symbol's ESI, and the symbol
+// vector's own header (payload length, fragment index, fragment count).
+func sourceDatagram(seq, esi uint32, length, index, count int) []byte {
+	d := make([]byte, sourceHeader+symbolHeader+length)
+	binary.BigEndian.PutUint32(d, seq)
+	d[4] = kindSource
+	binary.BigEndian.PutUint32(d[5:], esi)
+	binary.BigEndian.PutUint16(d[sourceHeader:], uint16(length))
+	binary.BigEndian.PutUint16(d[sourceHeader+2:], uint16(index))
+	binary.BigEndian.PutUint16(d[sourceHeader+4:], uint16(count))
+	return d
+}
+
+// The fragment count is two bytes a peer controls. A symbol claiming a span
+// wider than any frame this protocol carries used to be honored far enough
+// to allocate for it: fifteen bytes of wire held half a megabyte of slots,
+// and a burst of them was an unbounded multiple of the wire in memory. The
+// span is now refused at the datagram boundary, the same place and for the
+// same reason a repair's span is.
+func TestAnImpossibleFragmentSpanIsRefused(t *testing.T) {
+	a, _, _ := paths(t, 6, 0, 0.42)
+	for i := range 200 {
+		frames := a.onDatagram(sourceDatagram(uint32(i), uint32(i), 0, 0, maxSymbolParts+1))
+		if len(frames) != 0 {
+			t.Fatalf("a refused symbol delivered %d frames", len(frames))
+		}
+	}
+	if got := a.Stats().Malformed; got != 200 {
+		t.Fatalf("malformed datagrams = %d, want 200", got)
+	}
+	if live := len(a.assembler.groups); live != 0 {
+		t.Fatalf("%d groups were opened for refused symbols", live)
+	}
+}
+
+// The parser enforces the same span bound on every path into the assembler,
+// including the symbols a repair recovers.
+func TestParseSymbolBoundsTheClaimedSpan(t *testing.T) {
+	vector := make([]byte, symbolHeader+8)
+	binary.BigEndian.PutUint16(vector[4:], maxSymbolParts+1)
+	if _, _, _, ok := parseSymbol(vector); ok {
+		t.Fatal("a span wider than the protocol permits was accepted")
+	}
+	binary.BigEndian.PutUint16(vector[2:], maxSymbolParts-1)
+	binary.BigEndian.PutUint16(vector[4:], maxSymbolParts)
+	if _, _, count, ok := parseSymbol(vector); !ok || count != maxSymbolParts {
+		t.Fatalf("the widest legal span was refused: ok=%v count=%d", ok, count)
+	}
+}
+
+// A group is sized by what arrives, not by the width its first symbol
+// claimed: a claim is a declaration, and the memory that backs it must be
+// earned by symbols on the wire. The groups the assembly window still owes
+// hold one slot each, and the window retires the rest.
+func TestUnfilledClaimsHoldOnlyWhatArrived(t *testing.T) {
+	var a assembler
+	var out [][]byte
+	symbol := make([]byte, symbolHeader)
+	binary.BigEndian.PutUint16(symbol[4:], maxSymbolParts)
+	for esi := uint32(1); esi <= maxSymbolParts+assemblerSlack+8; esi++ {
+		out = a.arrived(esi, symbol, out)
+	}
+	if len(out) != 0 {
+		t.Fatalf("incomplete groups delivered %d frames", len(out))
+	}
+	live := 0
+	for _, group := range a.groups {
+		live++
+		if len(group.parts) != 1 {
+			t.Fatalf("a group holds %d slots for one arrived symbol", len(group.parts))
+		}
+		if group.count != maxSymbolParts {
+			t.Fatalf("group width = %d, want %d", group.count, maxSymbolParts)
+		}
+	}
+	if live > maxSymbolParts+assemblerSlack+1 {
+		t.Fatalf("%d groups outlived the assembly window", live)
 	}
 }

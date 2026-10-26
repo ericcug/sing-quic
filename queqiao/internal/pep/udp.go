@@ -155,6 +155,13 @@ func newClientUDPPacketConn(c *Client, assoc *udpAssociation, onClose func(error
 // read cadence, and only resolves a destination the server named by name
 // when the peer itself answers with one.
 func (c *clientUDPPacketConn) readLoop() {
+	// udpFrames claimed this flow's share of the lane connection's coded
+	// datagrams; this loop is the subscription's last consumer, so it is the
+	// one that returns it. Without this, every UDP association leaves its
+	// queue in the demux of a pooled connection that outlives it, and a
+	// long-running client accumulates them until the whole generation is
+	// replaced. The server-side association releases on the same boundary.
+	defer c.association.lane.fc.releaseBulk(c.association.flowID)
 	for {
 		select {
 		case <-c.ctx.Done():
@@ -518,9 +525,15 @@ func (s *Server) handleUDPAssociation(ctx context.Context, conn streamConn, fc *
 	}
 	packets := make(chan udpDatagram, 32)
 	packetErr := make(chan error, 1)
-	packetBuffer := buf.NewSize(maxUDPDatagramBuffer)
-	defer packetBuffer.Release()
+	// The reader owns its buffer. Releasing it from the association below
+	// would hand a pooled buffer back while a ReadPacket still blocked on this
+	// socket writes into it: the defers run before packetConn closes, and
+	// whichever session borrows the buffer next would race this one for its
+	// contents. Keeping allocation and release inside the goroutine is the
+	// ownership rule the upstream relay reader follows.
 	go func() {
+		packetBuffer := buf.NewSize(maxUDPDatagramBuffer)
+		defer packetBuffer.Release()
 		for {
 			packetBuffer.Reset()
 			destination, readErr := packetConn.ReadPacket(packetBuffer)

@@ -341,7 +341,7 @@ func (p *Path) appendFrame(frame []byte) error {
 // consecutive, so any one of them names the group.
 func (p *Path) sendFragments(frame []byte, limit int) error {
 	count := (len(frame) + limit - 1) / limit
-	if count > maxFragments {
+	if count > maxSymbolParts {
 		return fmt.Errorf("%w: %d bytes", ErrFrameTooLarge, len(frame))
 	}
 	for i := 0; i < count; i++ {
@@ -355,6 +355,15 @@ func (p *Path) sendFragments(frame []byte, limit int) error {
 
 // maxFragments is what the fragment count field can say.
 const maxFragments = 0xFFFF
+
+// maxSymbolParts is the widest fragment span a receiver will hold, and the
+// widest a sender will emit. The count field can name 65535 parts; no frame
+// this protocol carries needs a fraction of that, because the largest
+// payload version 1 defines, split at the default symbol width, stays under
+// a hundred fragments. The bound mirrors the repair-span bound: both are
+// peer declarations of how much the receiver must hold for one frame, and
+// an unbounded one let fifteen bytes of wire claim half a megabyte of slots.
+const maxSymbolParts = fec.MaxRepairWindow
 
 // flushPacked sends the whole frames accumulated so far as one symbol.
 func (p *Path) flushPacked() error {
@@ -545,6 +554,22 @@ func (p *Path) onDatagram(d []byte) [][]byte {
 	case kindSource:
 		esi := binary.BigEndian.Uint32(d[5:])
 		vector := d[sourceHeader:]
+		// The count a source symbol names is how many symbols its frame
+		// needs before it exists. Two bytes on the wire can name a span of
+		// 65535, which no frame this protocol carries requires, and a
+		// receiver that honored it would hold half a megabyte of slots for
+		// fifteen bytes of wire. The bound belongs here, before the symbol
+		// reaches the decoder or the assembler, for the same reason the
+		// repair-span bound below does: this is the last point that still
+		// knows the datagram came from a peer. A rejected source MUST NOT be
+		// counted as an erasure for the same reason a rejected repair must
+		// not: it is a peer disagreeing about the wire.
+		if len(vector) >= symbolHeader {
+			if count := int(binary.BigEndian.Uint16(vector[4:])); count > maxSymbolParts {
+				p.malformed.Add(1)
+				return nil
+			}
+		}
 		p.sources.Add(1)
 		delivered = p.decoder.Source(esi, vector)
 		frames = p.assembler.arrived(esi, vector, frames)
@@ -596,7 +621,14 @@ type assembler struct {
 }
 
 type fragmentGroup struct {
+	// parts holds the fragments that have arrived, indexed from the group's
+	// first symbol. It grows to the highest arrived index rather than to the
+	// count the first symbol claimed: the count is a peer's declaration of
+	// the group's width, and sizing the slice for it up front let fifteen
+	// wire bytes hold half a megabyte of slots. count is kept separately as
+	// the width the group must reach before its frame exists.
 	parts [][]byte
+	count int
 	held  int
 	bytes int
 }
@@ -627,16 +659,21 @@ func (a *assembler) arrived(esi uint32, vector []byte, out [][]byte) [][]byte {
 		if a.groups == nil {
 			a.groups = map[uint32]*fragmentGroup{}
 		}
-		group = &fragmentGroup{parts: make([][]byte, count)}
+		group = &fragmentGroup{count: count}
 		a.groups[first] = group
 	}
-	if index >= len(group.parts) || group.parts[index] != nil {
+	if index >= group.count || (index < len(group.parts) && group.parts[index] != nil) {
 		return out
+	}
+	if index >= len(group.parts) {
+		grown := make([][]byte, index+1)
+		copy(grown, group.parts)
+		group.parts = grown
 	}
 	group.parts[index] = append([]byte(nil), payload...)
 	group.held++
 	group.bytes += len(payload)
-	if group.held < len(group.parts) {
+	if group.held < group.count {
 		return out
 	}
 	delete(a.groups, first)
@@ -652,7 +689,7 @@ func (a *assembler) lost(esi uint32) {
 	a.note(esi)
 	a.lostN++
 	for first, group := range a.groups {
-		if int32(esi-first) >= 0 && int32(esi-first) < int32(len(group.parts)) {
+		if int32(esi-first) >= 0 && int32(esi-first) < int32(group.count) {
 			delete(a.groups, first)
 		}
 	}
@@ -673,7 +710,7 @@ const assemblerSlack = fec.MinDecoderWidth
 
 func (a *assembler) prune() {
 	for first, group := range a.groups {
-		if int32(a.high-(first+uint32(len(group.parts)))) > assemblerSlack {
+		if int32(a.high-(first+uint32(group.count))) > assemblerSlack {
 			delete(a.groups, first)
 		}
 	}
@@ -708,7 +745,12 @@ func parseSymbol(vector []byte) ([]byte, int, int, bool) {
 	count := int(binary.BigEndian.Uint16(vector[4:]))
 	// A recovered symbol is padded to the length of the repair that recovered
 	// it, so it is long enough rather than exactly long enough.
-	if count < 1 || index >= count || symbolHeader+length > len(vector) {
+	//
+	// The count is bounded here as well as at the datagram boundary because
+	// this is the parser that every path into the assembler crosses, and a
+	// parser is where a wire bound belongs even when the callers above it
+	// already enforce it.
+	if count < 1 || count > maxSymbolParts || index >= count || symbolHeader+length > len(vector) {
 		return nil, 0, 0, false
 	}
 	return vector[symbolHeader : symbolHeader+length], index, count, true

@@ -347,6 +347,14 @@ func (p *Path) sendFragments(frame []byte, limit int) error {
 	for i := 0; i < count; i++ {
 		end := min((i+1)*limit, len(frame))
 		if err := p.emit(frame[i*limit:end], i, count); err != nil {
+			if errors.Is(err, errOversize) {
+				// The limit moved under this frame: the fragments still
+				// unsent cannot fit it, and the group can never complete at
+				// the receiver. Spending them on refusals buys nothing --
+				// stop. The frame is the session's to re-issue, and the
+				// reissue is sized from the revised limit.
+				return nil
+			}
 			return err
 		}
 	}
@@ -372,6 +380,12 @@ func (p *Path) flushPacked() error {
 	}
 	err := p.emit(p.packed, 0, 1)
 	p.packed = p.packed[:0]
+	if errors.Is(err, errOversize) {
+		// The packed frames were refused for size, not lost to a failure:
+		// the session above re-issues them at the revised limit, exactly as
+		// it re-issues what the channel erased.
+		return nil
+	}
 	return err
 }
 
@@ -388,21 +402,42 @@ func (p *Path) emit(payload []byte, index, count int) error {
 	p.encoder.SetCapacity(code.capacity)
 	esi := p.encoder.Add(vector)
 	if err := p.sendSource(esi, vector); err != nil {
+		if errors.Is(err, errOversize) {
+			// The vector is in the window, sized for a limit that no longer
+			// exists; every repair reaching over it is as oversized as it is.
+			// The caller decides what a refused symbol means for its frame.
+			p.dropOversizedWindow()
+		}
 		return err
 	}
 	p.burstSymbols++
-	if p.burstSymbols >= p.encoder.Capacity() {
-		// A window's worth has been covered at the running rate. What still
-		// needs protecting when the producer stops is whatever follows this.
-		p.burstSymbols, p.burstRepairs = 0, 0
-	}
 	for p.credit += code.rate; p.credit >= 1; p.credit-- {
 		if err := p.sendRepair(0); err != nil {
 			return err
 		}
 		p.burstRepairs++
 	}
+	// A window's worth has been covered at the running rate. What still
+	// needs protecting when the producer stops is whatever follows this --
+	// and the repairs just spent cover the window that closed here, so they
+	// belong to the burst that ended, and the burst is closed only after
+	// they are counted into it. code.capacity is the code's own window, not
+	// the ring's rounded-up length.
+	if p.burstSymbols >= code.capacity {
+		p.burstSymbols, p.burstRepairs = 0, 0
+	}
 	return nil
+}
+
+// dropOversizedWindow empties the encoder window after the carrier refused
+// a datagram for size. The symbols it held cannot be repaired over the new
+// limit -- their repairs are as oversized as they are -- so what the window
+// was holding protection for is already gone, and keeping it only keeps the
+// refusals coming. The burst it was accumulating protection for ended with
+// the window, so its bookkeeping ends here too.
+func (p *Path) dropOversizedWindow() {
+	p.encoder.Reset()
+	p.burstSymbols, p.burstRepairs = 0, 0
 }
 
 // protectBurst tops the burst up to what the code says a run of that length
@@ -470,6 +505,17 @@ func (p *Path) sendRepair(count int) error {
 	sent, err := p.put(d)
 	if sent {
 		p.repairs.Add(1)
+		return nil
+	}
+	if errors.Is(err, errOversize) {
+		// A repair is as long as the longest symbol it spans, so this is the
+		// window saying it holds symbols sized for a limit that is gone.
+		// Until they age out -- which an interactive flow may never make
+		// happen -- every further repair is refused the same way, and the
+		// code protects nothing. Drop the window; what it held was already
+		// unrecoverable by repair.
+		p.dropOversizedWindow()
+		return nil
 	}
 	return err
 }
@@ -492,6 +538,14 @@ func (p *Path) take() uint32 {
 // the numbering describing exactly what went out.
 func (p *Path) untake() { p.nextSeq-- }
 
+// errOversize reports a datagram the carrier refused for its size. It is not
+// a failure of the path: the limit moved, and the next symbol is sized from
+// the revised one. It is a signal, so each caller can do what its own layer
+// owes -- the window drops what it can no longer repair, a fragmented frame
+// stops spending fragments on refusals -- rather than every layer treating a
+// size change as a reason to close.
+var errOversize = errors.New("coded: datagram exceeds the carrier's revised limit")
+
 // put hands one datagram to the carrier and reports whether it reached it.
 func (p *Path) put(d []byte) (bool, error) {
 	switch err := p.carrier.Send(d); {
@@ -506,7 +560,7 @@ func (p *Path) put(d []byte) (bool, error) {
 		// the wire, so the peer must not be shown a gap for it.
 		p.oversize.Add(1)
 		p.untake()
-		return false, nil
+		return false, errOversize
 	default:
 		p.untake()
 		p.fail(err)

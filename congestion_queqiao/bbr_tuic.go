@@ -554,14 +554,22 @@ func (b *TUICBBRSender) OnCongestionEventEx(priorInFlight quiccongestion.ByteCou
 	// Adding bytesAcked in calculateRecoveryWindow then permits the newly
 	// acknowledged amount while accounting for losses in the same event.
 	b.calculateRecoveryWindow(bytesAckedWindow, lostBytes, b.bytesInFlight)
-	if leastUnacked, ok := obsoletePacketNumber(acked, lost); ok {
-		b.estimator.removeObsolete(leastUnacked)
-	}
 	if isRoundStart {
 		b.lossEventsInRound = 0
 		b.bytesLostInRound = 0
 	}
 	b.publishTelemetry()
+}
+
+// OnPacketsLost receives the least packet number still outstanding, which the
+// fork reports after every congestion event across all of the connection's
+// packet-number spaces. Packet states below it are no longer reachable by any
+// future ACK or loss report and are retired here -- the precise form of the
+// largest-ack-minus-two approximation this used to derive inside the event,
+// which could not see across packet-number spaces and mis-sized a pure-loss
+// event's watermark.
+func (b *TUICBBRSender) OnPacketsLost(leastUnacked quiccongestion.PacketNumber) {
+	b.estimator.removeObsolete(leastUnacked)
 }
 
 func saturatingRemaining(inFlight quiccongestion.ByteCount, acked, lost uint64) quiccongestion.ByteCount {
@@ -651,36 +659,6 @@ func (b *TUICBBRSender) appLimited(priorInFlight quiccongestion.ByteCount) bool 
 	available := window - priorInFlight
 	drainLimited := b.mode == tuicBbrDrain && priorInFlight > window/2
 	return !drainLimited || available > tuicMaxBurstPackets*b.maxDatagramSize
-}
-
-func obsoletePacketNumber(acked []quiccongestion.AckedPacketInfo, lost []quiccongestion.LostPacketInfo) (quiccongestion.PacketNumber, bool) {
-	var largest quiccongestion.PacketNumber = -1
-	if len(acked) > 0 {
-		for _, packet := range acked {
-			if packet.PacketNumber > largest {
-				largest = packet.PacketNumber
-			}
-		}
-		if largest < 0 {
-			return 0, false
-		}
-		if largest > 1 {
-			return largest - 2, true
-		}
-		return 0, true
-	}
-	for _, packet := range lost {
-		if packet.PacketNumber > largest {
-			largest = packet.PacketNumber
-		}
-	}
-	if largest < 0 {
-		return 0, false
-	}
-	if largest == quiccongestion.PacketNumber(^uint64(0)>>1) {
-		return largest, true
-	}
-	return largest + 1, true
 }
 
 func (b *TUICBBRSender) updateRecoveryState(lastAckedPacket quiccongestion.PacketNumber, hasLosses, roundStart bool) {
@@ -1052,4 +1030,3 @@ func (a *tuicAckAggregation) update(newlyAcked uint64, now monotime.Time, round,
 }
 func (b *TUICBBRSender) OnAppLimited(bytesInFlight quiccongestion.ByteCount)       {}
 func (b *TUICBBRSender) OnPacketNeutered(packetNumber quiccongestion.PacketNumber) {}
-func (b *TUICBBRSender) OnPacketsLost(leastUnacked quiccongestion.PacketNumber)    {}

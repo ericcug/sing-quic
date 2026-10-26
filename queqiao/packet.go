@@ -67,6 +67,11 @@ type packetPipe struct {
 	peerDone  <-chan struct{}
 	closeOnce sync.Once
 	deadline  pipe.Deadline
+	// writeDeadline bounds a WritePacket the peer is not draining. Without
+	// one, a stopped reader on the other end parks the writer forever, and
+	// the writer here is often the only goroutine that also watches the
+	// association's idle and lifetime timers.
+	writeDeadline pipe.Deadline
 }
 
 type routedPacket struct {
@@ -79,15 +84,19 @@ func newPacketPipe() (*packetPipe, *packetPipe) {
 	bToA := make(chan routedPacket, 64)
 	aDone := make(chan struct{})
 	bDone := make(chan struct{})
-	a := &packetPipe{recv: bToA, send: aToB, done: aDone, peerDone: bDone, deadline: pipe.MakeDeadline()}
-	b := &packetPipe{recv: aToB, send: bToA, done: bDone, peerDone: aDone, deadline: pipe.MakeDeadline()}
+	a := &packetPipe{recv: bToA, send: aToB, done: aDone, peerDone: bDone, deadline: pipe.MakeDeadline(), writeDeadline: pipe.MakeDeadline()}
+	b := &packetPipe{recv: aToB, send: bToA, done: bDone, peerDone: aDone, deadline: pipe.MakeDeadline(), writeDeadline: pipe.MakeDeadline()}
 	return a, b
 }
 
 func (p *packetPipe) ReadPacket(buffer *buf.Buffer) (M.Socksaddr, error) {
 	select {
 	case packet := <-p.recv:
-		_, err := buffer.ReadOnceFrom(packet.buffer)
+		// Written rather than ReadOnceFrom: an empty datagram is a legal
+		// packet, and reading one from an empty buffer surfaces as io.EOF
+		// -- which the caller above treats as the association ending, over
+		// a peer that sent nothing worse than a zero-length datagram.
+		_, err := buffer.Write(packet.buffer.Bytes())
 		packet.buffer.Release()
 		return packet.destination, err
 	case <-p.done:
@@ -95,7 +104,7 @@ func (p *packetPipe) ReadPacket(buffer *buf.Buffer) (M.Socksaddr, error) {
 	case <-p.peerDone:
 		select {
 		case packet := <-p.recv:
-			_, err := buffer.ReadOnceFrom(packet.buffer)
+			_, err := buffer.Write(packet.buffer.Bytes())
 			packet.buffer.Release()
 			return packet.destination, err
 		default:
@@ -114,6 +123,9 @@ func (p *packetPipe) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) er
 	case <-p.peerDone:
 		buffer.Release()
 		return io.ErrClosedPipe
+	case <-p.writeDeadline.Wait():
+		buffer.Release()
+		return os.ErrDeadlineExceeded
 	default:
 	}
 	select {
@@ -125,6 +137,9 @@ func (p *packetPipe) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) er
 	case <-p.peerDone:
 		buffer.Release()
 		return io.ErrClosedPipe
+	case <-p.writeDeadline.Wait():
+		buffer.Release()
+		return os.ErrDeadlineExceeded
 	}
 }
 
@@ -144,6 +159,10 @@ func (p *packetPipe) Close() error {
 }
 
 func (p *packetPipe) LocalAddr() net.Addr                { return M.Socksaddr{} }
-func (p *packetPipe) SetDeadline(t time.Time) error      { return os.ErrInvalid }
-func (p *packetPipe) SetReadDeadline(t time.Time) error  { p.deadline.Set(t); return nil }
-func (p *packetPipe) SetWriteDeadline(t time.Time) error { return os.ErrInvalid }
+func (p *packetPipe) SetDeadline(t time.Time) error {
+	p.deadline.Set(t)
+	p.writeDeadline.Set(t)
+	return nil
+}
+func (p *packetPipe) SetReadDeadline(t time.Time) error      { p.deadline.Set(t); return nil }
+func (p *packetPipe) SetWriteDeadline(t time.Time) error     { p.writeDeadline.Set(t); return nil }

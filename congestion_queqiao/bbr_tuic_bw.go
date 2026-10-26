@@ -180,10 +180,10 @@ func (e *tuicBandwidthEstimator) onLost(number quiccongestion.PacketNumber) tuic
 	}
 }
 
-// removeObsolete drops states that are below the oldest packet QUIC is likely
-// to retain. The extended quic-go callback does not expose FirstOutstanding,
-// so callers pass the same bounded packet-threshold approximation used by the
-// upstream TUIC controller.
+// removeObsolete drops states that are below the oldest packet QUIC still has
+// outstanding. The fork's extended callback reports that number exactly --
+// OnPacketsLost, after every congestion event, across all of the connection's
+// packet-number spaces -- so that is what callers pass.
 //
 // It walks the range being dropped rather than scanning the map, because
 // packet numbers only increase and so everything below leastUnacked that is

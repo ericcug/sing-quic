@@ -591,3 +591,89 @@ func TestAChannelNothingHasMeasuredIsNotACleanChannel(t *testing.T) {
 			"once there is evidence, or the burst never fires on a real link")
 	}
 }
+
+// The seed is the delivered rate the pool expects of this lane, and the
+// erasure compensation is applied exactly once, by this wrapper. Seeding the
+// inner controller with the already-divided number -- as an earlier version
+// did -- left bandwidth() and GetCongestionWindow() dividing by the arrival
+// rate a second time, so the wire overshot by 1/arrival and the next Report
+// fed the inflated number back into the pool.
+func TestAJoiningSenderSeedsTheDeliveredRateNotTheWireRate(t *testing.T) {
+	const rate, roundTrip = 2e6, 250 * time.Millisecond
+	model := pathmodel.NewPathModel()
+	model.Report(1, pathmodel.Observation{Erasure: 0.42, BurstFactor: 1, ObservedSamples: 5000, Delivered: rate, RoundTrip: roundTrip})
+	state := model.Current()
+	if state.Seed <= 0 {
+		t.Fatal("the model has no seed to test with")
+	}
+	seeded := NewErasureSenderOn(1200, model)
+	// The inner estimate is the seed itself, not the seed already divided by
+	// the arrival rate: that compensation belongs to this wrapper and is
+	// applied exactly once, in bandwidth() and GetCongestionWindow().
+	if got, want := seeded.inner.estimator.estimate(), float64(state.Seed); float64(got) < want*0.95 || float64(got) > want*1.05 {
+		t.Fatalf("inner estimate after seeding = %d, want about the seed %.0f (a second division by the arrival rate would put it near %.0f)",
+			got, want, want/0.58)
+	}
+	// The wire rate is the wrapper's own arithmetic: the inner pacing rate --
+	// or the share, whichever is smaller -- divided by the arrival rate once.
+	base := float64(seeded.inner.bandwidth())
+	if share := float64(seeded.share.Load()); share > 0 && share < base {
+		base = share
+	}
+	if want, got := base/0.58, float64(seeded.bandwidth()); got < want*0.95 || got > want*1.05 {
+		t.Fatalf("wire rate %.0f, want one compensation of %.0f; a second division would put it near %.0f",
+			got, want, base/0.58/0.58)
+	}
+}
+
+// The seeded erasure compensation survives the first compensation decision.
+// A zero appliedArrival used to make that decision reset the arrival to no
+// compensation, so a replacement lane paid the erasure ramp again in the very
+// round the seeding existed to skip.
+func TestASeededCompensationIsNotResetByTheFirstDecision(t *testing.T) {
+	const erasure = 0.42
+	model := pathmodel.NewPathModel()
+	model.Report(1, pathmodel.Observation{Erasure: erasure, BurstFactor: 1, ObservedSamples: 5000, Delivered: 2e6, RoundTrip: 250 * time.Millisecond})
+	seeded := NewErasureSenderOn(1200, model)
+	if got := seeded.compensationFor(1 - erasure); got < 0.55 || got > 0.61 {
+		t.Fatalf("first compensation = %v, want the seeded %.2f honored at once (a reset would leave the %.2f step)",
+			got, 1-erasure, compensationStep)
+	}
+}
+
+// What the pool is told is what this lane delivers: the inner estimate capped
+// by its share. The pacing rate -- a gain times the estimate -- is what goes
+// on the wire, and reporting it as delivery inflated the pool's bottleneck by
+// whatever gain phase the lane happened to be in.
+func TestThePoolIsToldTheDeliveredEstimateNotThePacingRate(t *testing.T) {
+	e := NewErasureSender(1200)
+	e.inner.seedBandwidth(2e6, 250*time.Millisecond)
+	if pacing := e.inner.bandwidth(); pacing <= 2e6 {
+		t.Fatalf("inner bandwidth %d did not carry its startup gain over the estimate", pacing)
+	}
+	if got := e.deliveredEstimate(); got < 1.9e6 || got > 2.1e6 {
+		t.Fatalf("delivered estimate %.0f, want about the seeded 2e6", got)
+	}
+	e.share.Store(uint64(1e6 * 0)) // zero share means uncapped
+	if got := e.deliveredEstimate(); got < 1.9e6 || got > 2.1e6 {
+		t.Fatalf("uncapped delivered estimate %.0f, want about 2e6", got)
+	}
+	e.share.Store(uint64(1e6))
+	if got := e.deliveredEstimate(); got < 0.95e6 || got > 1.05e6 {
+		t.Fatalf("share-capped delivered estimate %.0f, want about the 1e6 share", got)
+	}
+}
+
+// Without a pooled model the lane's own measured loss is its erasure: the
+// telemetry and the burst ceiling must not see a path that never erases.
+func TestAnUnpooledSenderStillMeasuresErasure(t *testing.T) {
+	e := NewErasureSender(1200)
+	lost := make([]quiccongestion.LostPacketInfo, 64)
+	for i := range lost {
+		lost[i] = quiccongestion.LostPacketInfo{PacketNumber: quiccongestion.PacketNumber(i), BytesLost: 1200}
+	}
+	e.OnCongestionEventEx(0, monotime.Now(), nil, lost)
+	if got := e.Telemetry().Erasure; got <= 0 {
+		t.Fatalf("erasure after a fully losing event = %v, want the measured loss", got)
+	}
+}

@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"math/rand"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -710,5 +712,140 @@ func TestUnfilledClaimsHoldOnlyWhatArrived(t *testing.T) {
 	}
 	if live > maxSymbolParts+assemblerSlack+1 {
 		t.Fatalf("%d groups outlived the assembly window", live)
+	}
+}
+
+// sizedWire is a lossless bidirectional carrier pair whose datagram limit can
+// shrink mid-stream, the way a QUIC connection's estimate of what fits a
+// packet does when the path changes under it.
+type sizedWire struct {
+	mu      sync.Mutex
+	limit   int
+	sent    int
+	refused int
+	out     chan []byte
+	in      <-chan []byte
+	closed  chan struct{}
+}
+
+func newSizedWires(limit int) (*sizedWire, *sizedWire) {
+	a2b := make(chan []byte, 8192)
+	b2a := make(chan []byte, 8192)
+	aDone := make(chan struct{})
+	bDone := make(chan struct{})
+	forward := &sizedWire{limit: limit, out: a2b, in: b2a, closed: aDone}
+	backward := &sizedWire{limit: limit, out: b2a, in: a2b, closed: bDone}
+	return forward, backward
+}
+
+func (w *sizedWire) shrink(limit int) {
+	w.mu.Lock()
+	w.limit = limit
+	w.mu.Unlock()
+}
+
+func (w *sizedWire) Send(d []byte) error {
+	w.mu.Lock()
+	if len(d) > w.limit {
+		w.refused++
+		limit := w.limit
+		w.mu.Unlock()
+		return fmt.Errorf("%w: %d bytes offered, %d accepted", ErrDatagramTooLarge, len(d), limit)
+	}
+	w.sent++
+	w.mu.Unlock()
+	cp := append([]byte(nil), d...)
+	select {
+	case w.out <- cp:
+	default:
+	}
+	return nil
+}
+
+func (w *sizedWire) Receive() ([]byte, error) {
+	select {
+	case d := <-w.in:
+		return d, nil
+	case <-w.closed:
+		return nil, errors.New("closed")
+	}
+}
+
+func (w *sizedWire) Close() error {
+	select {
+	case <-w.closed:
+	default:
+		close(w.closed)
+	}
+	return nil
+}
+
+// MaxDatagramBytes is what tells the path how large a symbol may be.
+func (w *sizedWire) MaxDatagramBytes() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.limit
+}
+
+func (w *sizedWire) stats() (sent, refused int) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.sent, w.refused
+}
+
+// When the carrier's limit shrinks below the symbols already in the encoder
+// window, every repair over those symbols is as oversized as they are. The
+// window used to hold them until they aged out -- which an interactive flow
+// may never make happen -- and the code protected nothing in the meantime.
+// The window is dropped at the refusal, so repairs resume at the new limit.
+func TestAShrunkCarrierDoesNotKillRepairsForAWindow(t *testing.T) {
+	forward, backward := newSizedWires(1100)
+	cfg := Config{SymbolBytes: 1100, RoundTrip: 60 * time.Millisecond, Path: measuredPath(0.42)}
+	a, b := New(forward, cfg), New(backward, cfg)
+	t.Cleanup(func() { a.Close(); b.Close() })
+
+	// Establish a coded exchange at the original limit, so the encoder window
+	// fills with 1100-byte symbols and repairs are being earned.
+	const warmup = 40
+	for i := range warmup {
+		if err := a.Send([]byte(fmt.Sprintf("frame-%d-%s", i, strings.Repeat("x", 900)))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for range warmup {
+		if _, err := b.Receive(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_, refusedBefore := forward.stats()
+	repairsBefore := a.Stats().Repairs
+
+	// The path's estimate of what fits collapses.
+	forward.shrink(600)
+	backward.shrink(600)
+
+	// Keep exchanging: the frames that follow are sized from the revised
+	// limit, and what must not happen is every repair dying on the window's
+	// old 1100-byte symbols until they age out.
+	const after = 60
+	for i := range after {
+		if err := a.Send([]byte(fmt.Sprintf("late-%d-%s", i, strings.Repeat("y", 500)))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for range after {
+		if _, err := b.Receive(); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	_, refusedAfter := forward.stats()
+	if refusedAfter == refusedBefore {
+		t.Skip("the shrink never refused a datagram; the test measured nothing")
+	}
+	if repairs := a.Stats().Repairs; repairs <= repairsBefore {
+		t.Fatalf("no repairs were sent after the shrink (%d before, %d after, %d refusals) -- "+
+			"the encoder window kept oversized symbols and killed the code",
+			repairsBefore, repairs, refusedAfter-refusedBefore)
 	}
 }

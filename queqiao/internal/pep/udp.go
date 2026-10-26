@@ -40,6 +40,12 @@ import (
 // maxUDPDatagramBuffer bounds one inbound datagram read from the router.
 const maxUDPDatagramBuffer = 65535
 
+// udpRelayWriteTimeout bounds one handed-over datagram on the association's
+// application pipe. It is a liveness bound, not a latency target: the relay
+// loop that writes there is also the one that watches the association's idle
+// and lifetime timers.
+const udpRelayWriteTimeout = 10 * time.Second
+
 type udpCounters struct {
 	up   atomic.Uint64
 	down atomic.Uint64
@@ -621,8 +627,15 @@ func (s *Server) handleUDPAssociation(ctx context.Context, conn streamConn, fc *
 				packet.Release()
 				continue
 			}
+			// The write is bounded because this loop is the one that watches
+			// the association's idle and lifetime timers: parked here on a
+			// peer that stopped reading, those timers could never fire. A
+			// datagram that cannot be handed over in time is dropped -- what
+			// an unreliable substrate does -- and the association stays alive
+			// to time out on its own clock.
+			_ = packetConn.SetWriteDeadline(time.Now().Add(udpRelayWriteTimeout))
 			if writeErr = packetConn.WritePacket(packet, M.ParseSocksaddr(destination)); writeErr != nil {
-				if udperr.Transient(writeErr) {
+				if udperr.Transient(writeErr) || errors.Is(writeErr, os.ErrDeadlineExceeded) {
 					continue
 				}
 				endErr = writeErr

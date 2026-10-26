@@ -773,14 +773,28 @@ func dialQUICConnection(ctx context.Context, dialer N.Dialer, remote string, tls
 		if dialErr != nil {
 			return nil, nil, dialErr
 		}
-		addr, isUDPAddr := udpConn.RemoteAddr().(*net.UDPAddr)
-		if !isUDPAddr {
+		// A direct dialer returns a *net.UDPConn; a dialer that followed a
+		// detour returns a bound packet connection whose remote address is
+		// the Socksaddr it was opened for. Both name the same peer, and
+		// asking for one specific type here rejected every detoured flow at
+		// the moment it was about to succeed.
+		addr := udpRemoteAddr(udpConn.RemoteAddr())
+		if addr == nil {
 			_ = udpConn.Close()
 			return nil, nil, fmt.Errorf("queqiao: dialer returned a non-UDP peer %v", udpConn.RemoteAddr())
 		}
 		remoteAddr = addr
 		packetConn = &connectedPacketConn{Conn: udpConn, remoteAddr: addr}
 	} else {
+		if dialer != nil {
+			// Port hopping needs an unbound socket to migrate between ports,
+			// which the host's dialer does not return, so it is bypassed --
+			// and with it the routing mark, the binding and any detour the
+			// configuration asked this transport to follow. That deserves a
+			// line where the operator will see it rather than silent
+			// divergence from every other transport.
+			slog.Warn("queqiao: port hopping bypasses the configured dialer; detour, routing mark and address binding do not apply")
+		}
 		resolved, resolveErr := resolveUDPAddr(dialCtx, remote, resolver)
 		if resolveErr != nil {
 			return nil, nil, resolveErr
@@ -966,10 +980,6 @@ func configureQUICController(conn *quic.Conn, cfg congestionConfig) wancongestio
 	return nil
 }
 
-// peerKey identifies the endpoint pair a connection belongs to. It is the
-// peer's address without its port: a second lane to the same server opens a
-// new port and must still share, because the bottleneck it will contend for is
-// the same one.
 // peerKey identifies the path a connection runs over, which is a pair: the
 // uplink it leaves by and the peer it reaches.
 //
@@ -1051,6 +1061,28 @@ func routeSource(remote net.Addr) string {
 	}
 	defer conn.Close()
 	return addressHost(conn.LocalAddr())
+}
+
+// udpRemoteAddr names the UDP peer an address stands for. A direct dialer
+// returns *net.UDPAddr; a dialer that followed a detour returns a bound
+// packet connection whose remote address is the Socksaddr it was opened for.
+// A name that was never resolved to an address names no UDP peer at all.
+func udpRemoteAddr(addr net.Addr) *net.UDPAddr {
+	switch a := addr.(type) {
+	case *net.UDPAddr:
+		return a
+	case M.Socksaddr:
+		if !a.IsIP() {
+			return nil
+		}
+		return a.UDPAddr()
+	case *M.Socksaddr:
+		if !a.IsIP() {
+			return nil
+		}
+		return a.UDPAddr()
+	}
+	return nil
 }
 
 func addressHost(addr net.Addr) string {

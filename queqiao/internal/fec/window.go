@@ -195,6 +195,20 @@ func (e *WindowEncoder) Capacity() int { return len(e.ring) }
 // Held is how many it currently holds, which is less until it has filled.
 func (e *WindowEncoder) Held() int { return e.held }
 
+// Reset drops every symbol the window holds, keeping its capacity.
+//
+// It exists for a carrier whose datagram limit shrank below symbols already
+// in the window: every repair over those symbols is as oversized as the
+// symbols themselves, so until they age out -- which on an interactive flow
+// they may never do -- the code protects nothing. What the window held is
+// already unrecoverable by repair, so dropping it costs nothing the shrink
+// had not already cost.
+func (e *WindowEncoder) Reset() {
+	clear(e.ring)
+	e.first = e.next
+	e.held = 0
+}
+
 // Add takes a source symbol into the window and returns its identifier. The
 // symbol is copied, because the window outlives the caller's buffer.
 func (e *WindowEncoder) Add(vector []byte) uint32 {

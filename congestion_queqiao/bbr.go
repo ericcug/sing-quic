@@ -235,9 +235,20 @@ func (b *BBRSender) HasPacingBudget(now monotime.Time) bool {
 	return b.pacer.budget(now) >= b.maxDatagramSize
 }
 
-func (b *BBRSender) OnPacketSent(sentTime monotime.Time, bytesInFlight quiccongestion.ByteCount, number quiccongestion.PacketNumber, bytes quiccongestion.ByteCount, _ bool) {
+func (b *BBRSender) OnPacketSent(sentTime monotime.Time, bytesInFlight quiccongestion.ByteCount, number quiccongestion.PacketNumber, bytes quiccongestion.ByteCount, retransmittable bool) {
 	b.lastSent = number
 	// bytesInFlight is the value before this packet is accounted for.
+	//
+	// A packet the connection does not count as in flight -- a pure ACK --
+	// never appears in an acknowledgement or a loss report, so it has no
+	// state worth recording and no bytes worth counting; recording it anyway
+	// is what filled the table with entries only the quadratic prune could
+	// remove.
+	if !retransmittable {
+		b.bytesInFlight = maxByteCount(0, bytesInFlight)
+		b.publishTelemetry()
+		return
+	}
 	if bytes < 0 || bytesInFlight < 0 || bytes > maxCongestionByteCount-bytesInFlight {
 		b.bytesInFlight = maxCongestionByteCount
 	} else {
@@ -683,4 +694,17 @@ func (b *BBRSender) publishTelemetry() {
 func (b *BBRSender) Telemetry() ControllerTelemetry                            { return b.telemetry.snapshot() }
 func (b *BBRSender) OnAppLimited(bytesInFlight quiccongestion.ByteCount)       {}
 func (b *BBRSender) OnPacketNeutered(packetNumber quiccongestion.PacketNumber) {}
-func (b *BBRSender) OnPacketsLost(leastUnacked quiccongestion.PacketNumber)    {}
+
+// OnPacketsLost retires per-packet states below the least number still
+// outstanding, which the fork reports after every congestion event. A packet
+// below that watermark can no longer be acknowledged or declared lost -- it
+// is not in flight -- which is exactly the fate of a pure ACK's state:
+// recorded on send, reported by neither callback, and previously retained
+// until the table filled and the quadratic prune ran.
+func (b *BBRSender) OnPacketsLost(leastUnacked quiccongestion.PacketNumber) {
+	for number := range b.sendStates {
+		if number < leastUnacked {
+			delete(b.sendStates, number)
+		}
+	}
+}

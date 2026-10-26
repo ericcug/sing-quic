@@ -262,8 +262,20 @@ func (c *frameConn) bulkFrames(flowID uint64) <-chan protocol.Frame {
 }
 
 func (c *frameConn) releaseBulk(flowID uint64) {
-	if demux := connBulkDemux(c.bulk, c.bulkQueueFrames); demux != nil {
-		demux.release(flowID)
+	// A lookup, deliberately not connBulkDemux: that helper creates the
+	// demux when it is missing, so a release racing the connection's own
+	// teardown -- the coded path's cleaner already deleted the demux, and
+	// this lane's reader is now exiting -- would install a fresh one keyed
+	// by the closed path and leave it in the global table with nothing to
+	// remove it. What is gone stays gone.
+	if c.bulk == nil {
+		return
+	}
+	bulkDemuxMu.Lock()
+	existing, ok := bulkDemuxs.Load(c.bulk)
+	bulkDemuxMu.Unlock()
+	if ok {
+		existing.(*bulkDemux).release(flowID)
 	}
 }
 

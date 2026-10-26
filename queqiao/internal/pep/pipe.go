@@ -32,6 +32,12 @@ type streamPipe struct {
 	readDeadline  pipe.Deadline
 	writeDeadline pipe.Deadline
 
+	// readMu guards unread, the tail of a chunk the caller's buffer could not
+	// accept. Every current use has a single reader per end; the mutex keeps
+	// that assumption honest if a caller ever shares one.
+	readMu sync.Mutex
+	unread []byte
+
 	writeOnce sync.Once
 	closeOnce sync.Once
 }
@@ -74,28 +80,47 @@ func newStreamPipe() (net.Conn, net.Conn) {
 }
 
 func (p *streamPipe) Read(b []byte) (int, error) {
+	p.readMu.Lock()
+	defer p.readMu.Unlock()
+	// A chunk the previous caller buffer could not accept is delivered first:
+	// its bytes belong to this stream whether or not the next buffer is any
+	// larger.
+	if len(p.unread) > 0 {
+		n := copy(b, p.unread)
+		p.unread = p.unread[n:]
+		return n, nil
+	}
 	for {
+		// Closure and an already-passed deadline report themselves before
+		// anything is taken, the same order sing's own pipe uses.
+		select {
+		case <-p.localDone:
+			return 0, io.ErrClosedPipe
+		case <-p.readDeadline.Wait():
+			return 0, os.ErrDeadlineExceeded
+		default:
+		}
 		// Buffered chunks outlive the peer's write half-close, so they are
 		// drained before EOF is reported.
 		select {
 		case chunk := <-p.readChunks:
-			return copy(b, chunk), nil
+			return p.deliverChunk(b, chunk), nil
 		default:
 		}
 		select {
 		case chunk := <-p.readChunks:
-			return copy(b, chunk), nil
+			return p.deliverChunk(b, chunk), nil
 		case <-p.remoteWriteDone:
 			select {
 			case chunk := <-p.readChunks:
-				return copy(b, chunk), nil
+				return p.deliverChunk(b, chunk), nil
 			default:
 			}
 			return 0, io.EOF
 		case <-p.remoteDone:
 			select {
 			case chunk := <-p.readChunks:
-				return copy(b, chunk), nil
+				return p.deliverChunk(b, chunk), nil
 			default:
 			}
 			return 0, io.EOF
@@ -107,7 +132,41 @@ func (p *streamPipe) Read(b []byte) (int, error) {
 	}
 }
 
+// deliverChunk copies what b accepts and keeps the rest for the next Read.
+// A chunk larger than the caller's buffer is the ordinary case, not an
+// exception: a reassembler on the receive side merges whatever arrived
+// contiguously into one write, and the application above reads with its own
+// smaller buffers. Dropping the tail -- what a bare copy did -- was silent
+// data corruption in both directions, and net.Conn's contract for a short
+// Read is precisely that the remaining bytes stay available.
+func (p *streamPipe) deliverChunk(b, chunk []byte) int {
+	n := copy(b, chunk)
+	if n < len(chunk) {
+		p.unread = chunk[n:]
+	}
+	return n
+}
+
 func (p *streamPipe) Write(b []byte) (int, error) {
+	// Closure and an already-passed deadline are checked before the fast path
+	// so a closed connection cannot accept writes no reader will ever take.
+	select {
+	case <-p.localDone:
+		return 0, io.ErrClosedPipe
+	case <-p.localWriteDone:
+		return 0, io.ErrClosedPipe
+	case <-p.remoteDone:
+		return 0, io.ErrClosedPipe
+	case <-p.writeDeadline.Wait():
+		return 0, os.ErrDeadlineExceeded
+	default:
+	}
+	if len(b) == 0 {
+		// A zero-length write carries no byte and no boundary. Queueing an
+		// empty chunk would make the peer's Read return (0, nil), which is
+		// neither data nor EOF.
+		return 0, nil
+	}
 	chunk := make([]byte, len(b))
 	copy(chunk, b)
 	for {
@@ -122,6 +181,8 @@ func (p *streamPipe) Write(b []byte) (int, error) {
 		case <-p.remoteDone:
 			return 0, io.ErrClosedPipe
 		case <-p.localWriteDone:
+			return 0, io.ErrClosedPipe
+		case <-p.localDone:
 			return 0, io.ErrClosedPipe
 		case <-p.writeDeadline.Wait():
 			return 0, os.ErrDeadlineExceeded

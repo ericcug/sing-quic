@@ -575,12 +575,6 @@ const (
 // congestion controller outbound packets to measure. That is the only sound
 // source for its sending direction; reverse-direction arrivals cannot reveal
 // which losses the peer caused by its offered rate.
-// handlePathProbe accepts only a small, destination-free sequence and reflects
-// each validated frame exactly once. The equal-size authenticated echo cannot
-// amplify traffic or name a destination, and it gives this endpoint's own
-// congestion controller outbound packets to measure. That is the only sound
-// source for its sending direction; reverse-direction arrivals cannot reveal
-// which losses the peer caused by its offered rate.
 func (s *Server) handlePathProbe(fc *frameConn, first protocol.Frame) {
 	frames, bytes := 0, 0
 	frame := first

@@ -2508,12 +2508,6 @@ const (
 	ackBytesThreshold = 64 * 1024
 )
 
-// scheduleACK publishes the newest cumulative receive sequence without
-// blocking application delivery on a control-frame write. QUIC already
-// provides hop reliability; these protocol ACKs exist to bound the replay
-// window and support cross-lane resume, so they can be cumulative and
-// coalesced. A failed write transitions the lane and lets run's normal rescue
-// coordinator replace it; an independent error is reported through ackErr.
 // acknowledgeArrival tells the peer what has arrived, whether or not this
 // segment advanced the contiguous point, and returns the cumulative point now
 // acknowledged.
@@ -2574,6 +2568,12 @@ func (f *multipathFlow) repeatACK(lane *mpLane) {
 	}
 }
 
+// scheduleACK publishes the newest cumulative receive sequence without
+// blocking application delivery on a control-frame write. QUIC already
+// provides hop reliability; these protocol ACKs exist to bound the replay
+// window and support cross-lane resume, so they can be cumulative and
+// coalesced. A failed write transitions the lane and lets run's normal rescue
+// coordinator replace it; an independent error is reported through ackErr.
 func (f *multipathFlow) scheduleACK(sequence uint64) {
 	if sequence == 0 || f.ackClosing.Load() {
 		return

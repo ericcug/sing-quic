@@ -193,12 +193,25 @@ func NewErasureSenderOn(initialPacketSize quiccongestion.ByteCount, path pathmod
 		if state.Erasure > 0 {
 			e.arrival.Store(uint64((1 - state.Erasure) * partsPerMillion))
 			e.erasure.Store(uint64(state.Erasure * partsPerMillion))
+			// appliedArrival mirrors the seeded arrival. The first
+			// compensation decision would otherwise see a zero
+			// appliedArrival, decide the controller had never started, and
+			// reset the arrival to no compensation -- discarding in the
+			// first round the erasure knowledge this seeding exists to carry.
+			e.appliedArrival = 1 - state.Erasure
 		}
 		if state.Seed > 0 {
 			if state.Share > 0 {
 				e.share.Store(uint64(state.Share))
 			}
-			e.inner.seedBandwidth(uint64(state.Seed/e.arrivalRate()), state.RoundTrip)
+			// The seed is the delivered rate the pool expects of this lane.
+			// The erasure compensation that divides by the arrival rate
+			// belongs to this wrapper, and is applied exactly once, in
+			// bandwidth() and GetCongestionWindow(). Seeding it into the
+			// inner controller already divided left the same division
+			// applied twice -- the wire rate overshot by 1/arrival, and the
+			// next Report fed the inflated number back into the pool.
+			e.inner.seedBandwidth(uint64(state.Seed), state.RoundTrip)
 		}
 	}
 	return e
@@ -235,6 +248,19 @@ func newErasureSender(initialPacketSize quiccongestion.ByteCount) *ErasureSender
 // there. The burst allowance is measured against this for the same reason.
 func (e *ErasureSender) deliveredRate() float64 {
 	delivered := float64(e.inner.bandwidth())
+	if share := float64(e.share.Load()); share > 0 && share < delivered {
+		delivered = share
+	}
+	return delivered
+}
+
+// deliveredEstimate is what this lane actually delivers: the inner
+// controller's delivered-rate estimate, capped by its share when the pool has
+// assigned one. It is the number the path pool is told, and the number the
+// compensation bet is judged against; both are statements about delivery, and
+// the pacing rate -- gain times the estimate -- is neither.
+func (e *ErasureSender) deliveredEstimate() float64 {
+	delivered := float64(e.inner.estimator.estimate())
 	if share := float64(e.share.Load()); share > 0 && share < delivered {
 		delivered = share
 	}
@@ -592,21 +618,36 @@ func (e *ErasureSender) OnCongestionEventEx(priorInFlight quiccongestion.ByteCou
 	} else {
 		e.congestive.Store(0)
 	}
+	// The inner controller's own view of this event runs first, so the
+	// round trip, the round, and the delivered estimate the decisions below
+	// read are this event's rather than the previous one's.
+	e.inner.OnCongestionEventEx(priorInFlight, eventTime, acked, lost)
 	erasure := snapshot.Loss
 	if e.path != nil {
 		// Pool with the other lanes: the estimate converges on all their
 		// samples together, and the share is what stops their probes
 		// compounding.
+		//
+		// What is reported is the delivered-rate estimate -- the inner
+		// controller's own delivered estimate, capped by this lane's share
+		// -- and not its bandwidth(), which is the pacing rate: a gain times
+		// the estimate. The pool's bottleneck is the sum of what its lanes
+		// deliver, and the seed it hands back is a portion of that. A pacing
+		// rate inflates both by whatever gain phase the lane happens to be
+		// in, and an uncapped one reports a rate the share was holding down.
 		state := e.path.Report(e.id(), pathmodel.Observation{
 			Erasure: snapshot.Loss, BurstFactor: snapshot.BurstFactor,
 			ObservedSamples: float64(snapshot.Decided),
-			Delivered:       float64(e.inner.bandwidth()),
+			Delivered:       e.deliveredEstimate(),
 			RoundTrip:       e.inner.minRoundTrip(),
 		})
 		erasure = state.Erasure
-		e.erasure.Store(uint64(state.Erasure * partsPerMillion))
 		e.share.Store(uint64(state.Share))
 	}
+	// Without a pooled model the lane's own measured loss is its erasure:
+	// telemetry and the unmetered-burst ceiling read the same number either
+	// way, rather than one of them seeing a path that was never pooled.
+	e.erasure.Store(uint64(erasure * partsPerMillion))
 	// The compensation rides on the measurement rather than on a floor biased
 	// low for pacing. Under-compensating is not the safe direction it looks
 	// like: pacing a delivered-rate estimate makes the sending rate its own
@@ -629,7 +670,6 @@ func (e *ErasureSender) OnCongestionEventEx(priorInFlight quiccongestion.ByteCou
 	}
 
 	e.passed.Add(uint64(len(lost)))
-	e.inner.OnCongestionEventEx(priorInFlight, eventTime, acked, lost)
 }
 
 func (e *ErasureSender) OnRetransmissionTimeout(retransmitted bool) {
@@ -692,4 +732,6 @@ func (e *ErasureSender) Channel() (lossmodel.Snapshot, uint64) {
 }
 func (e *ErasureSender) OnAppLimited(bytesInFlight quiccongestion.ByteCount)       {}
 func (e *ErasureSender) OnPacketNeutered(packetNumber quiccongestion.PacketNumber) {}
-func (e *ErasureSender) OnPacketsLost(leastUnacked quiccongestion.PacketNumber)    {}
+func (e *ErasureSender) OnPacketsLost(leastUnacked quiccongestion.PacketNumber) {
+	e.inner.OnPacketsLost(leastUnacked)
+}
